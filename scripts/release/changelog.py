@@ -4,7 +4,8 @@
   changelog.py plan [--bump auto|patch|minor|major] [--first X.Y.Z]
       -> prints JSON {"version", "previous", "notes"} for the [Unreleased] section
   changelog.py finalize VERSION DATE
-      -> turns [Unreleased] into "## [VERSION] - DATE" and adds a fresh [Unreleased]
+      -> turns [Unreleased] into "## [VERSION] - DATE", adds a fresh [Unreleased],
+         and writes VERSION into controller/pve_watchdog/__init__.py
   changelog.py notes VERSION
       -> prints that version's section (for the release page)
 
@@ -18,6 +19,8 @@ import re
 import sys
 
 PATH = "CHANGELOG.md"
+VERSION_FILE = "controller/pve_watchdog/__init__.py"
+VERSION_LINE = re.compile(r'^__version__ = "[^"]*"$', re.M)
 HEAD = re.compile(r"^## \[([^\]]+)\](?:\s*-\s*(\S+))?\s*$", re.M)
 
 
@@ -107,6 +110,14 @@ def notes(text, version):
     raise ChangelogError("no [%s] section" % version)
 
 
+def set_version(source, version):
+    """Return SOURCE with its __version__ line set to VERSION (exactly one such line)."""
+    parse_version(version)
+    if len(VERSION_LINE.findall(source)) != 1:
+        raise ChangelogError("%s must have exactly one __version__ line" % VERSION_FILE)
+    return VERSION_LINE.sub('__version__ = "%s"' % version, source)
+
+
 def main(argv):
     text = open(PATH).read()
     try:
@@ -116,7 +127,12 @@ def main(argv):
             print(json.dumps(plan(text, bump, first)))
         elif argv[1] == "finalize":
             new = finalize(text, argv[2], argv[3])
+            with open(VERSION_FILE) as f:
+                src = set_version(f.read(), argv[2])
             open(PATH, "w").write(new)
+            with open(VERSION_FILE, "w") as f:
+                f.write(src)
+            print("%s: __version__ = %s" % (VERSION_FILE, argv[2]))
             print("CHANGELOG.md: [Unreleased] -> [%s] - %s" % (argv[2], argv[3]))
         elif argv[1] == "notes":
             print(notes(text, argv[2]))

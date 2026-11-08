@@ -11,7 +11,9 @@ Steps:
   3. pattern checks (tests/check_repo.py: emails, IPs, MACs) on the copy
   4. the private word list (regular expressions, one per line) against the
      CONTENT and the PATH of every file, and against the commit/tag messages.
-     Missing or empty list = fail. Non-UTF-8 file = fail. Matches are never printed.
+     Missing or empty list = fail. Non-UTF-8 file = fail, except a PNG in
+     docs/images/ whose sha256 is in docs/images/approved.sha256 and that has
+     no metadata chunks (check_repo.image_problem). Matches are never printed.
   5. relative links in Markdown files must resolve inside the copy
 """
 import io
@@ -103,7 +105,9 @@ def wordlist_check(out, patterns, messages):
             with open(os.path.join(out, rel), encoding="utf-8") as f:
                 text = f.read()
         except UnicodeDecodeError:
-            problems.append("%s: not UTF-8 text" % rel)
+            bad = check_repo.image_problem(out, rel)
+            if bad:
+                problems.append(bad)
             continue
         if any(p.search(text) for p in patterns):
             problems.append("%s: a word-list entry matches the content" % rel)

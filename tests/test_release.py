@@ -1,4 +1,5 @@
 """Tests of the release tooling: pattern checks, public-copy builder, changelog, publisher."""
+import hashlib
 import importlib.util
 import os
 import subprocess
@@ -180,6 +181,64 @@ CL = """# Changelog
 """
 
 
+def png(*chunks, tail=b""):
+    out = b"\x89PNG\r\n\x1a\n"
+    for kind, data in (("IHDR", b"\0" * 13),) + chunks + (("IEND", b""),):
+        out += len(data).to_bytes(4, "big") + kind.encode() + data + b"\0\0\0\0"
+    return out + tail
+
+
+class ImageTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.root, "docs", "images"))
+
+    def put(self, rel, data, approve=True):
+        with open(os.path.join(self.root, rel), "wb") as f:
+            f.write(data)
+        if approve:
+            with open(os.path.join(self.root, "docs/images/approved.sha256"), "a") as f:
+                f.write("%s  %s\n" % (hashlib.sha256(data).hexdigest(), os.path.basename(rel)))
+
+    def problems(self):
+        return check_repo.check(self.root)
+
+    def test_approved_png_passes(self):
+        self.put("docs/images/shot.png", png(("IDAT", b"pixels")))
+        self.assertEqual(self.problems(), [])
+
+    def test_unlisted_png_fails(self):
+        self.put("docs/images/shot.png", png(("IDAT", b"pixels")), approve=False)
+        self.assertTrue(any("not listed" in p for p in self.problems()))
+
+    def test_changed_png_fails(self):
+        self.put("docs/images/shot.png", png(("IDAT", b"pixels")))
+        with open(os.path.join(self.root, "docs/images/shot.png"), "wb") as f:
+            f.write(png(("IDAT", b"other pixels")))
+        self.assertTrue(any("not listed" in p for p in self.problems()))
+
+    def test_metadata_chunk_fails_even_if_approved(self):
+        self.put("docs/images/shot.png", png(("tEXt", b"Comment\0host secret"), ("IDAT", b"x")))
+        self.assertTrue(any("metadata" in p for p in self.problems()))
+
+    def test_data_after_end_fails(self):
+        self.put("docs/images/shot.png", png(("IDAT", b"x"), tail=b"hidden"))
+        self.assertTrue(any("after its end" in p for p in self.problems()))
+
+    def test_png_outside_images_dir_fails(self):
+        self.put("shot.png", png(("IDAT", b"x")))
+        self.assertTrue(any("not UTF-8" in p for p in self.problems()))
+
+    def test_approval_is_for_one_name(self):
+        data = png(("IDAT", b"x"))
+        self.put("docs/images/a.png", data)
+        self.put("docs/images/b.png", data, approve=False)
+        self.assertTrue(any("b.png" in p and "not listed" in p for p in self.problems()))
+
+    def test_repo_images_pass(self):
+        self.assertEqual([p for p in check_repo.check(ROOT) if "docs/images" in p], [])
+
+
 class ChangelogTests(unittest.TestCase):
     def test_bumps(self):
         self.assertEqual(changelog.plan(CL)["version"], "1.2.4")
@@ -195,6 +254,21 @@ class ChangelogTests(unittest.TestCase):
     def test_upgrading_line_required(self):
         with self.assertRaises(changelog.ChangelogError):
             changelog.plan(CL.replace("**Upgrading:** nothing to do.\n\n### Fixed", "### Fixed", 1))
+
+    def test_set_version(self):
+        src = '"""doc"""\n__version__ = "1.0.0"\n'
+        self.assertEqual(changelog.set_version(src, "1.2.3"), '"""doc"""\n__version__ = "1.2.3"\n')
+        with self.assertRaises(changelog.ChangelogError):
+            changelog.set_version(src, "1.2")
+        with self.assertRaises(changelog.ChangelogError):
+            changelog.set_version("x = 1\n", "1.2.3")
+
+    def test_code_version_matches_newest_release(self):
+        with open(os.path.join(ROOT, "CHANGELOG.md")) as f:
+            newest = changelog.previous_version(f.read())
+        import pve_watchdog
+        self.assertEqual(pve_watchdog.__version__, newest,
+                         "controller/pve_watchdog/__init__.py and CHANGELOG.md disagree")
 
     def test_finalize(self):
         new = changelog.finalize(CL, "1.2.4", "2026-02-02")
@@ -261,6 +335,74 @@ class PublishTests(unittest.TestCase):
         publish.prepare(self.public, self.copy, "1.1.0")
         with self.assertRaises(publish.PublishError):
             publish.prepare(self.public, self.copy, "1.0.5")
+
+    def _write(self, path, text):
+        full = os.path.join(self.copy, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+
+    def test_docs_publish_between_releases(self):
+        publish.prepare(self.public, self.copy, "1.0.0")
+        self._write("README.md", "v1 nicer\n")
+        self._write("docs/how.md", "details\n")
+        self._write("old.txt", "code change that must NOT go out with docs\n")
+        self.assertEqual(publish.prepare_docs(self.public, self.copy), "prepared")
+        self.assertEqual(git(self.public, "log", "-1", "--format=%s|%ae"),
+                         "pve-watchdog docs: update|41898282+github-actions[bot]@users.noreply.github.com")
+        self.assertEqual(git(self.public, "tag", "--list"), "v1.0.0")          # no tag
+        with open(os.path.join(self.public, "old.txt")) as f:
+            self.assertEqual(f.read(), "goes away later\n")                   # code untouched
+        self.assertEqual(publish.prepare_docs(self.public, self.copy), "unchanged")
+        self._write("README.md", "v1 nicer still\n")
+        self.assertEqual(publish.prepare_docs(self.public, self.copy), "prepared")  # docs on docs
+        self.assertEqual(publish.prepare(self.public, self.copy, "1.0.1"), "prepared")
+        self.assertEqual(git(self.public, "tag", "--list"), "v1.0.0\nv1.0.1")
+
+    def test_docs_push_after_rehearsal_still_pushes(self):
+        publish.prepare(self.public, self.copy, "1.0.0")
+        remote = tempfile.mkdtemp()
+        git(remote, "init", "-q", "--bare")
+        git(self.public, "remote", "add", "origin", remote)
+        git(self.public, "push", "-q", "-u", "origin", "main")
+        self._write("README.md", "v1 nicer\n")
+        self.assertEqual(publish.prepare_docs(self.public, self.copy), "prepared")   # rehearsal
+        self.assertEqual(publish.prepare_docs(self.public, self.copy), "prepared")   # --push run
+        git(self.public, "push", "-q", "origin", "HEAD:main")
+        git(self.public, "fetch", "-q")
+        self.assertEqual(publish.prepare_docs(self.public, self.copy), "unchanged")
+
+    def test_docs_publish_needs_a_release_first(self):
+        with self.assertRaises(publish.PublishError):
+            publish.prepare_docs(self.public, self.copy)
+
+    def test_hand_commit_after_docs_commit_still_stops_a_release(self):
+        publish.prepare(self.public, self.copy, "1.0.0")
+        self._write("README.md", "docs\n")
+        publish.prepare_docs(self.public, self.copy)
+        with open(os.path.join(self.public, "README.md"), "w") as f:
+            f.write("owner edit\n")
+        git(self.public, "commit", "-qam", "pve-watchdog docs: update")      # right subject, not the bot
+        with self.assertRaises(publish.PublishError):
+            publish.prepare(self.public, self.copy, "1.0.1")
+        with self.assertRaises(publish.PublishError):
+            publish.prepare_docs(self.public, self.copy)
+
+    def test_bot_commit_touching_code_is_not_a_docs_commit(self):
+        publish.prepare(self.public, self.copy, "1.0.0")
+        with open(os.path.join(self.public, "old.txt"), "w") as f:
+            f.write("sneaky\n")
+        env = dict(os.environ, **publish.BOT)
+        subprocess.run(["git", "-C", self.public, "commit", "-qam", publish.DOCS_SUBJECT],
+                       env=env, check=True, capture_output=True)
+        with self.assertRaises(publish.PublishError):
+            publish.prepare(self.public, self.copy, "1.0.1")
+
+    def test_docs_symlink_refused(self):
+        publish.prepare(self.public, self.copy, "1.0.0")
+        os.symlink("/etc", os.path.join(self.copy, "docs"))
+        with self.assertRaises(publish.PublishError):
+            publish.prepare_docs(self.public, self.copy)
 
 
 if __name__ == "__main__":

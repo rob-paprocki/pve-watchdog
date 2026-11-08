@@ -7,6 +7,11 @@ let TAB = "dashboard";
 let timer = null;
 
 // ---------- small helpers ----------
+// Replace the page body; empty slots (null/undefined/false) are skipped, as in h().
+function setView(...kids) {
+  $("#view").replaceChildren(...kids.flat().filter((k) => k !== null && k !== undefined && k !== false));
+}
+
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -89,7 +94,7 @@ function initTheme() {
 function showLogin() {
   clearInterval(timer);
   $("#login").hidden = false;
-  $("#view").replaceChildren();
+  setView();
   $("#tabs").hidden = true;
   $("#logout").hidden = true;
   $("#user").textContent = "";
@@ -197,7 +202,7 @@ async function dashboard() {
     ? h("ul", {}, o.alerts.map((a) => h("li", {}, a.text, " ", h("span", { class: "muted small" }, ago(a.since)))))
     : h("p", { class: "muted" }, "No open alerts.");
 
-  $("#view").replaceChildren(
+  setView(
     o.dry_run ? h("div", { class: "card" }, pill("DRY-RUN", "warn"), " Nothing is changed anywhere until dry-run is switched off in Settings.") : null,
     h("div", { class: "grid" },
       nodeCards,
@@ -302,7 +307,7 @@ async function guests() {
          addBox]
       : h("p", { class: "muted" }, "Every container that can be protected already is. (VMs aren't supported yet.)"));
 
-  $("#view").replaceChildren(addCard, h("div", { class: "card" }, h("h2", {}, "Guests in the cluster"),
+  setView(addCard, h("div", { class: "card" }, h("h2", {}, "Guests in the cluster"),
     h("table", {}, h("tr", {}, h("th", {}, "Guest"), h("th", {}, "Type"), h("th", {}, "Node"), h("th", {}, "IP"),
       h("th", {}, "Protection"), h("th", {}, "Action")), rows)));
 }
@@ -332,7 +337,7 @@ async function nodes() {
   };
   Object.values(f).forEach((i) => i.addEventListener("input", update));
   update();
-  $("#view").replaceChildren(
+  setView(
     h("div", { class: "card" }, h("h2", {}, "Nodes"),
       h("table", {}, h("tr", {}, h("th", {}, "Name"), h("th", {}, "Host"), h("th", {}, "Watchdog"), h("th", {}, "Wake-on-LAN MAC"), h("th", {}, "")), rows)),
     h("div", { class: "card" }, h("h2", {}, "Add a node"),
@@ -391,7 +396,7 @@ async function settings() {
     act("Save settings", async () => { await api("POST", "/api/settings", body); await settings(); });
   } }, "Save settings");
   const hook = h("input", { type: "password", placeholder: conf.webhook_set ? "(set — type a new one to replace)" : "https://discord.com/api/webhooks/…" });
-  $("#view").replaceChildren(...cards,
+  setView(...cards,
     h("div", { class: "card" }, h("h3", {}, "Discord alerts"),
       h("p", { class: "small muted" }, "The webhook URL is stored in the root-only secret file and is never shown again."),
       h("label", {}, "Webhook URL", hook),
@@ -409,7 +414,7 @@ async function history() {
       if (!confirm("Restore the configuration saved at " + new Date(v.ts * 1000).toLocaleString() + "?")) return;
       act("Restore", async () => { await api("POST", "/api/history/restore", { ts: v.ts }); await history(); });
     } }, "Restore"))));
-  $("#view").replaceChildren(h("div", { class: "card" }, h("h2", {}, "Earlier configurations"),
+  setView(h("div", { class: "card" }, h("h2", {}, "Earlier configurations"),
     h("p", { class: "small muted" }, "Every save keeps the previous version (the last 10). Restoring also keeps the current one."),
     list.length ? h("table", {}, rows) : h("p", { class: "muted" }, "No earlier versions yet.")));
 }

@@ -1,0 +1,8 @@
+# SHA-256 of every image allowed in the public repo. Each one was looked at
+# by a person and shows only example data. tests/check_repo.py refuses any
+# image that isn't listed here (or that carries PNG metadata).
+# Regenerate screenshots with scripts/screenshots/demo_webui.py.
+d81d29c5cf0a2b3f30fbfd675db14cd093a3e869dc0f15a8b6a80f9172710a3f  webui-dashboard-dark.png
+2ca4016f491a29a9e1eb5be3c255fdc298a0ade359749f440ad451830ad90f44  webui-dashboard-light.png
+23c0fd0f6fe48bb6f43ec3a45aa78e6271235aac3dbd682e10fe0f8b44cf15cc  webui-guests-dark.png
+2de1bfc53020335075532ed2a8fb8fa242f0943c5058662beba578248176db3d  webui-guests-light.png

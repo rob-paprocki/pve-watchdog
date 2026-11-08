@@ -7,6 +7,24 @@ to do anything when upgrading.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-08
+**Upgrading:** re-run `get.sh` on each node to get the web UI fixes; nothing else
+changes.
+
+### Added
+- Web UI screenshots and diagrams in the README; the screenshots follow the
+  visitor's light or dark mode.
+
+### Changed
+- The README is shorter and leads with what it does and how to install it. The
+  full design, failure modes, go-live steps and uninstall moved to
+  `docs/how-it-works.md`.
+
+### Fixed
+- The web UI dashboard showed a stray "null" at the top when dry-run was off.
+- The web UI footer showed version 1.0.0 on 1.0.1; a release now writes its
+  version into the code too.
+
 ## [1.0.1] - 2026-11-08
 **Upgrading:** re-run the installer on each node (or `get.sh`); nothing else to do.
 

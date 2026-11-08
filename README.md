@@ -14,6 +14,14 @@ pointing at the right place.
 When the first node is healthy again, the container moves back, together with
 everything that changed while it was away.
 
+On each Proxmox node, as root:
+
+```bash
+bash -c "$(curl -fsSL https://github.com/rob-paprocki/pve-watchdog/releases/latest/download/get.sh)"
+```
+
+Everything starts in dry-run, so nothing changes until you say so. Details are under [Installation](#installation).
+
 ## Highlights
 
 - Runs on plain local LVM-thin storage. No ZFS, no shared storage, no QDevice.
@@ -27,7 +35,6 @@ everything that changed while it was away.
   pings and ARPs the container's own IP, and everything starts in dry-run.
 - A web UI on every node (Proxmox login), Discord alerts, Wake-on-LAN for a node
   that went down, and maintenance mode that switches itself on for normal reboots.
-- Installs with one command.
 
 ## Overview
 
@@ -41,6 +48,59 @@ every 10 seconds, keep a fresh copy of every protected container on the other
 node, and decide when to take over or hand back. They never run Proxmox
 commands themselves; a gatekeeper script on each host does, and it re-checks
 every safety rule before it acts.
+
+<table width="100%">
+<tr>
+<th width="50%">What runs where</th>
+<th width="50%">A power cut on pve1, start to finish</th>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 30, "rankSpacing": 40, "padding": 8}}}%%
+flowchart TB
+  subgraph N1["pve1"]
+    direction TB
+    W1["Watchdog<br/>CT 9100"] -->|"SSH"| G1["Gatekeeper"]
+    G1 --> A["CT 110 pihole<br/>running"]
+  end
+  subgraph N2["pve2"]
+    direction TB
+    W2["Watchdog<br/>CT 9101"] -->|"SSH"| G2["Gatekeeper"]
+    G2 --> S["CT 1110 pihole<br/>standby, stopped"]
+  end
+  W1 <-->|"checks every 10 s"| W2
+  A -.->|"copy every 30 min"| S
+```
+
+</td>
+<td width="50%" valign="top">
+
+```mermaid
+sequenceDiagram
+  participant pve1
+  participant pve2
+  Note over pve1: power cut
+  pve2->>pve1: ping, web port, cluster, watchdog
+  Note over pve2: no answer for 6 rounds
+  pve2-->>pve1: Wake-on-LAN
+  Note over pve2: wait 90 s, then ping and ARP CT 110's own IP
+  Note over pve2: nothing answers: start CT 1110 (about 3 min in)
+  Note over pve1: power back, healthy for 10 min
+  Note over pve2: stop CT 1110, take a final backup
+  pve2->>pve1: copy the backup into CT 110
+  Note over pve1: start CT 110
+  Note over pve2: CT 1110 is the standby again
+```
+
+</td>
+</tr>
+</table>
+
+Each watchdog's SSH key can run only its own node's gatekeeper script, and
+both read one shared config file in `/etc/pve`.
+
 
 There's no fencing, so this is less airtight than Proxmox HA. Read the [list of
 ways it can still go wrong](docs/how-it-works.md#what-can-still-go-wrong) before
@@ -57,17 +117,11 @@ You need Proxmox VE 8 or 9, a cluster of two or more nodes on one LAN, LVM-thin
 local storage, one free container ID and one free static IP per node, and
 internet access on the hosts while installing.
 
-On each node, as root:
-
-```bash
-bash -c "$(curl -fsSL https://github.com/rob-paprocki/pve-watchdog/releases/latest/download/get.sh)"
-```
-
-`get.sh` downloads the release, checks it against `SHA256SUMS` and starts a
-short wizard. The wizard finds the nodes and the gateway on its own, asks which
-container ID and IP each node's watchdog should get, and writes a config in
-dry-run mode, so nothing changes until you say so. Run the same command on the
-other nodes and they join the existing config.
+Run the command at the top as root on the first node. `get.sh` downloads the
+release, checks it against `SHA256SUMS` and starts a short wizard. The wizard
+finds the nodes and the gateway on its own, asks which container ID and IP the
+watchdog should get, and writes a config in dry-run mode. Run the same command
+on each other node and it joins the existing config.
 
 To pin a version, take `get.sh` from that release's page instead of "latest".
 
@@ -78,6 +132,18 @@ protect a container on the Guests tab. Every node's Notes panel in Proxmox also
 gets a link to it. New protection starts in dry-run; the
 [go-live steps](docs/how-it-works.md#going-live-one-container-at-a-time) cover
 switching it on.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/webui-dashboard-dark.png">
+  <img alt="The pve-watchdog dashboard: two nodes up, quorum, and three protected containers with the age of each standby copy" src="docs/images/webui-dashboard-light.png">
+</picture>
+
+The Guests tab lists everything in the cluster and is where you protect a container:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/webui-guests-dark.png">
+  <img alt="The Guests tab: every container and VM, which are protected, and the stopped standby copies on the other node" src="docs/images/webui-guests-light.png">
+</picture>
 
 From any node's shell:
 

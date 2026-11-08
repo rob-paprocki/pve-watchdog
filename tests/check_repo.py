@@ -17,6 +17,7 @@ Messages name the file, line and KIND of value, never the value itself.
 
 usage: check_repo.py [DIR]      (default: the git checkout this file is in)
 """
+import hashlib
 import ipaddress
 import os
 import re
@@ -88,6 +89,65 @@ def files_in(root):
     return found
 
 
+# Screenshots are the one exception to "public files are UTF-8 text". A word-list
+# or pattern scan can't read pixels, so an image is allowed only if a person has
+# looked at it: its SHA-256 must be listed in docs/images/approved.sha256 (a text
+# file, scanned like any other). It must also be a plain PNG with no chunk that
+# can carry text (comments, EXIF, timestamps...).
+IMAGE_DIR = "docs/images/"
+IMAGE_NAME = re.compile(r"^docs/images/[a-z0-9][a-z0-9-]*\.png$")
+APPROVED = IMAGE_DIR + "approved.sha256"
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+PNG_CHUNKS_OK = {b"IHDR", b"PLTE", b"IDAT", b"IEND", b"sRGB", b"gAMA", b"cHRM", b"pHYs", b"tRNS", b"bKGD"}
+IMAGE_MAX = 2 * 1024 * 1024
+
+
+def approved_images(root):
+    """{sha256: name} from docs/images/approved.sha256 ("<sha256>  <name>" lines)."""
+    found = {}
+    try:
+        with open(os.path.join(root, APPROVED), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    digest, name = line.split(None, 1)
+                    found[digest.lower()] = name.strip()
+    except (OSError, ValueError):
+        pass
+    return found
+
+
+def image_problem(root, rel, approved=None):
+    """None if REL is an approved, metadata-free PNG; otherwise why not."""
+    if not IMAGE_NAME.match(rel):
+        return "%s: not UTF-8 text" % rel
+    path = os.path.join(root, rel)
+    if os.path.islink(path):
+        return "%s: image is a symlink" % rel
+    with open(path, "rb") as f:
+        data = f.read(IMAGE_MAX + 1)
+    if len(data) > IMAGE_MAX:
+        return "%s: image is larger than 2 MB" % rel
+    if not data.startswith(PNG_SIG):
+        return "%s: not a PNG" % rel
+    pos, ended = len(PNG_SIG), False
+    while pos + 8 <= len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        if kind not in PNG_CHUNKS_OK:
+            return "%s: PNG has a %r chunk (metadata is not allowed)" % (rel, kind.decode("latin-1"))
+        pos += 12 + length
+        if kind == b"IEND":
+            ended = True
+            break
+    if not ended or pos != len(data):
+        return "%s: PNG is malformed or has data after its end" % rel
+    approved = approved_images(root) if approved is None else approved
+    if approved.get(hashlib.sha256(data).hexdigest()) != rel[len(IMAGE_DIR):]:
+        return "%s: image is not listed in %s (look at it, then add its sha256)" % (rel, APPROVED)
+    return None
+
+
 def check(root):
     problems = []
     for rel in sorted(files_in(root)):
@@ -98,7 +158,11 @@ def check(root):
             with open(path, encoding="utf-8") as f:
                 text = f.read()
         except UnicodeDecodeError:
-            problems.append("%s: not UTF-8 text" % rel)
+            bad = image_problem(root, rel)
+            if bad:
+                problems.append(bad)
+            for _line, kind in scan_text(rel):            # the image's name still counts
+                problems.append("%s: %s in the file name" % (rel, kind))
             continue
         except OSError:
             continue
