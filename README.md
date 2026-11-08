@@ -57,42 +57,18 @@ every safety rule before it acts.
 <tr>
 <td width="50%" valign="top">
 
-```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 30, "rankSpacing": 40, "padding": 8}}}%%
-flowchart TB
-  subgraph N1["pve1"]
-    direction TB
-    W1["Watchdog<br/>CT 9100"] -->|"SSH"| G1["Gatekeeper"]
-    G1 --> A["CT 110 pihole<br/>running"]
-  end
-  subgraph N2["pve2"]
-    direction TB
-    W2["Watchdog<br/>CT 9101"] -->|"SSH"| G2["Gatekeeper"]
-    G2 --> S["CT 1110 pihole<br/>standby, stopped"]
-  end
-  W1 <-->|"checks every 10 s"| W2
-  A -.->|"copy every 30 min"| S
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/diagram-architecture-dark.svg">
+  <img alt="What runs where: on each node a watchdog container talks over SSH to a gatekeeper script; CT 110 runs on pve1 and is copied every 30 minutes to its stopped standby CT 1110 on pve2" src="docs/images/diagram-architecture-light.svg" width="100%">
+</picture>
 
 </td>
 <td width="50%" valign="top">
 
-```mermaid
-sequenceDiagram
-  participant pve1
-  participant pve2
-  Note over pve1: power cut
-  pve2->>pve1: ping, web port, cluster, watchdog
-  Note over pve2: no answer for 6 rounds
-  pve2-->>pve1: Wake-on-LAN
-  Note over pve2: wait 90 s, then ping and ARP CT 110's own IP
-  Note over pve2: nothing answers: start CT 1110 (about 3 min in)
-  Note over pve1: power back, healthy for 10 min
-  Note over pve2: stop CT 1110, take a final backup
-  pve2->>pve1: copy the backup into CT 110
-  Note over pve1: start CT 110
-  Note over pve2: CT 1110 is the standby again
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/diagram-timeline-dark.svg">
+  <img alt="A power cut on pve1: pve2 sees no answer for 6 rounds, sends Wake-on-LAN, waits 90 seconds, checks the container's IP, starts CT 1110, and later stops it and copies its data back into CT 110 when pve1 has been healthy for 10 minutes" src="docs/images/diagram-timeline-light.svg" width="100%">
+</picture>
 
 </td>
 </tr>

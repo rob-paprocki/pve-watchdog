@@ -40,22 +40,10 @@ active one, so after any reboot only that copy is started.
 Every 10 seconds each watchdog checks each other node four ways: ping, the
 Proxmox web port, cluster membership and the other watchdog. Then:
 
-```mermaid
-flowchart TD
-  A["All four checks fail<br/>for another node"] --> B{"6 rounds<br/>in a row?"}
-  B -- no --> A
-  B -- yes --> C["Wait 90 s<br/>(Wake-on-LAN goes out meanwhile)"]
-  C --> D{"Node back?"}
-  D -- yes --> Z1["Nothing to do"]
-  D -- no --> E{"Gateway<br/>reachable?"}
-  E -- no --> Z2["This node is the one cut off:<br/>do nothing"]
-  E -- yes --> F{"Container's own IP<br/>answers ping or ARP?"}
-  F -- yes --> Z3["Abort and alert"]
-  F -- no --> G{"Quorum on<br/>its own?"}
-  G -- no --> H["pvecm expected 1<br/>(force mode, loud alert)"]
-  G -- yes --> I["Check the IP once more,<br/>start the standby"]
-  H --> I
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/diagram-decisions-dark.svg">
+  <img alt="The takeover decision: after 6 failed rounds and a 90 second wait it stops if the node came back, if this node can't reach the gateway, or if the container's IP answers; without quorum it forces it, then starts the standby" src="images/diagram-decisions-light.svg">
+</picture>
 
 Step by step:
 
