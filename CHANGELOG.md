@@ -7,6 +7,18 @@ to do anything when upgrading.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-08
+**Upgrading:** re-run `get.sh` on each node; nothing else to do.
+
+### Changed
+- The diagrams in the README and docs are images now, so they also show in
+  GitHub's mobile app (it doesn't draw Mermaid).
+
+### Fixed
+- After a node rebooted in the middle of a backup, every later backup of that
+  container failed ("Is a directory") until the leftover files were removed by
+  hand. Leftovers from an interrupted backup are now cleaned up first.
+
 ## [1.1.0] - 2026-11-08
 **Upgrading:** re-run `get.sh` on each node to get the web UI fixes; nothing else
 changes.

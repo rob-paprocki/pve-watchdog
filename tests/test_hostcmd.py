@@ -102,6 +102,23 @@ class Sandbox(unittest.TestCase):
         open(hc.ALLOW_LIVE, "w").close()
 
 
+class WorkDirTests(unittest.TestCase):
+    def test_clear_work_handles_interrupted_backup(self):
+        root = tempfile.mkdtemp()
+        work, outside = os.path.join(root, "work"), os.path.join(root, "outside")
+        os.makedirs(os.path.join(work, "vzdump-lxc-102-2026_11_08-15_25_55.tmp", "etc"))
+        os.makedirs(outside)
+        for name in ("vzdump-lxc-102-2026_11_08-15_25_55.tar.dat", "vzdump-lxc-102-old.tar.zst",
+                     "vzdump-lxc-1020-keep.tar.zst", "vzdump-lxc-103-keep.tar.zst"):
+            open(os.path.join(work, name), "w").close()
+        open(os.path.join(outside, "precious"), "w").close()
+        os.symlink(outside, os.path.join(work, "vzdump-lxc-102-link"))
+        hc.clear_work(work, 102)
+        self.assertEqual(sorted(os.listdir(work)),
+                         ["vzdump-lxc-1020-keep.tar.zst", "vzdump-lxc-103-keep.tar.zst"])
+        self.assertTrue(os.path.exists(os.path.join(outside, "precious")))   # link removed, not followed
+
+
 class ParseTests(Sandbox):
     def test_parse_pvecm(self):
         q = hc.parse_quorum(PVECM)

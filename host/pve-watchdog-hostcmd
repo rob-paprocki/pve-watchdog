@@ -730,6 +730,17 @@ def v_probe(cfg, ip):
 
 # ---- Verbs: changing --------------------------------------------------------
 
+def clear_work(work, vmid):
+    """Remove vzdump's files for VMID from the work dir: finished archives, and the
+    .tmp folder and partial .dat an interrupted backup (a reboot mid-vzdump) leaves.
+    Symlinks are removed, never followed; other IDs' files are left alone."""
+    for old in glob.glob("%s/vzdump-lxc-%d-*" % (work, vmid)):
+        if os.path.isdir(old) and not os.path.islink(old):
+            shutil.rmtree(old)
+        else:
+            os.unlink(old)
+
+
 @with_lock
 def v_backup(cfg, vmid, mode="snapshot"):
     """Make a verified backup of a container that runs on THIS node.
@@ -751,9 +762,8 @@ def v_backup(cfg, vmid, mode="snapshot"):
     if x.live:
         os.makedirs(work, exist_ok=True)
         os.makedirs(os.path.dirname(arc), exist_ok=True)
-        for old in glob.glob("%s/vzdump-lxc-%d-*" % (work, vmid)):
-            os.unlink(old)
-    used = sum(v["used"] for v in ct_volumes(cfg, vmid) if v["name"] in referenced_volumes(vmid))
+        clear_work(work, vmid)
+    used =sum(v["used"] for v in ct_volumes(cfg, vmid) if v["name"] in referenced_volumes(vmid))
     x.cmd(argv, timeout=6 * 3600)
     if not x.live:
         x.would.append("zstd -t <new archive>; replace %s atomically; write %s" % (arc, meta))
@@ -770,8 +780,7 @@ def v_backup(cfg, vmid, mode="snapshot"):
     with open(meta + ".new", "w") as f:
         json.dump(m, f)
     os.replace(meta + ".new", meta)
-    for leftover in glob.glob("%s/vzdump-lxc-%d-*" % (work, vmid)):
-        os.unlink(leftover)
+    clear_work(work, vmid)
     log("backup %d ok: %s (%d bytes)" % (vmid, arc, os.path.getsize(arc)))
     return x.result(archive=archive_meta(cfg, base))
 
