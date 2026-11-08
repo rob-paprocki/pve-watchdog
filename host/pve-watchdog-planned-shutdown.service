@@ -1,0 +1,23 @@
+# pve-watchdog: turn on maintenance mode automatically for a PLANNED
+# shutdown or reboot of this node (reboot command, web UI Reboot/Shutdown).
+#
+# How: this unit does nothing at boot; when the system shuts down normally,
+# systemd stops it, and its ExecStop sets the cluster-wide maintenance flag
+# for 20 minutes. Because it is ordered after pve-guests and pve-cluster,
+# it is stopped BEFORE those, while the cluster filesystem is still writable.
+#
+# A crash or power cut never runs ExecStop, so real failures still fail over.
+[Unit]
+Description=pve-watchdog: maintenance mode during planned shutdown/reboot
+After=pve-cluster.service corosync.service pve-guests.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/pve-watchdog-hostcmd maintenance on 1200
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

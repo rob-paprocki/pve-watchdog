@@ -1,0 +1,16 @@
+# pve-watchdog: keep Wake-on-LAN ("magic packet") switched on for the wired
+# network card(s) under vmbr0, so the other node's watchdog can power this
+# machine back on. The setting is lost at every boot, so this re-applies it.
+# It only changes the card's wake setting; no network config file is touched.
+# (The BIOS must also allow wake from the network card while powered off.)
+[Unit]
+Description=pve-watchdog: enable Wake-on-LAN on the bridge's network card(s)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for p in /sys/class/net/vmbr0/brif/*; do n=$(basename "$p"); [ -e "/sys/class/net/$n/device" ] && /usr/sbin/ethtool -s "$n" wol g && echo "Wake-on-LAN on for $n"; done; true'
+
+[Install]
+WantedBy=multi-user.target

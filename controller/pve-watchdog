@@ -1,0 +1,3 @@
+#!/bin/sh
+# Command-line entry point inside the controller: `pve-watchdog status`, etc.
+cd /opt/pve-watchdog && exec /usr/bin/python3 -m pve_watchdog "$@"

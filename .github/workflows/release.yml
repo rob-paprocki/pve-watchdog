@@ -1,0 +1,42 @@
+name: Release
+
+# Runs in the PUBLIC repository when a version tag arrives: builds the download
+# files (tarball, get.sh, SHA256SUMS) and the GitHub release.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'rob-paprocki/pve-watchdog'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tag must be exactly vX.Y.Z
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag name"; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tests
+        run: PYTHONPATH=controller python3 -m unittest discover -s tests
+      - name: Build download files
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz --prefix="pve-watchdog-$VERSION/" \
+              -o "pve-watchdog-$VERSION.tar.gz" "$GITHUB_REF_NAME"
+          sed "s/@VERSION@/$VERSION/" get.sh > get.sh.release && mv get.sh.release get.sh.out
+          mkdir dist && mv "pve-watchdog-$VERSION.tar.gz" dist/ && mv get.sh.out dist/get.sh
+          (cd dist && sha256sum "pve-watchdog-$VERSION.tar.gz" get.sh > SHA256SUMS && cat SHA256SUMS)
+          python3 scripts/release/changelog.py notes "$VERSION" > notes.md
+          printf '\n---\nInstall on each Proxmox node, as root:\n\n```bash\nbash -c "$(curl -fsSL https://github.com/%s/releases/download/%s/get.sh)"\n```\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> notes.md
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" dist/* --title "pve-watchdog $VERSION" --notes-file notes.md

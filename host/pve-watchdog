@@ -1,0 +1,14 @@
+#!/bin/bash
+# pve-watchdog, run directly on a Proxmox host's shell.
+# Forwards to this node's controller container, so instead of
+#     pct exec 9100 -- pve-watchdog maintenance on 1h
+# you can just type
+#     pve-watchdog maintenance on 1h
+set -euo pipefail
+CID="$(python3 -I - "$(hostname -s)" <<'PY'
+import sys, tomllib
+cfg = tomllib.load(open("/etc/pve/pve-watchdog/config.toml", "rb"))
+print(next(n["controller_id"] for n in cfg["node"] if n["name"] == sys.argv[1]))
+PY
+)"
+exec pct exec "$CID" -- /usr/local/bin/pve-watchdog "$@"

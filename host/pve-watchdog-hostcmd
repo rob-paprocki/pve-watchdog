@@ -1,0 +1,1374 @@
+#!/usr/bin/python3 -I
+"""
+pve-watchdog-hostcmd -- the host-side gatekeeper for pve-watchdog.
+
+WHAT THIS IS, IN PLAIN LANGUAGE
+  The controller container on each node ("the brain") decides WHAT should
+  happen, but it cannot run Proxmox commands itself. It asks this script,
+  over SSH, with a key that is only allowed to run this script and only
+  from the controller's own IP address.
+
+  This script knows a short, fixed list of actions (see VERBS at the bottom).
+  Before doing any of them it re-checks the safety rules on its own, so a
+  bug or a bad request from the brain can never touch a container that is
+  not in the config, never restore over a running container, never move a
+  container away from a node that is still alive, and so on.
+
+  NOTHING IS CHANGED unless ALL of these are true:
+    1. /etc/pve/pve-watchdog/config.toml says   dry_run = false
+    2. the file /etc/pve-watchdog/allow-live exists on THIS host
+    3. the container's [[ct]] entry says    mode = "live"
+  Otherwise it only logs "DRY-RUN would run: ..." and reports which safety
+  checks would have passed or failed.
+
+  Everything it does is logged to /var/log/pve-watchdog-hostcmd.log.
+
+Python 3 standard library only.
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+import tomllib
+
+# ---- Paths (tests override these) ------------------------------------------
+PVE = "/etc/pve"
+ALLOW_LIVE = "/etc/pve-watchdog/allow-live"
+LOG = "/var/log/pve-watchdog-hostcmd.log"
+LOCK = "/run/pve-watchdog-hostcmd.lock"
+VAR = "/var/lib/pve-watchdog"
+FORCE_DRY = False          # set by a leading --dry-run argument
+
+
+def CONFIG():
+    return PVE + "/pve-watchdog/config.toml"
+
+
+def SECRET():
+    return PVE + "/priv/pve-watchdog.secret.toml"
+
+
+def PARKED():
+    return PVE + "/pve-watchdog/parked"
+
+
+def MAINT():
+    return PVE + "/pve-watchdog/maintenance.json"
+
+
+class Refused(Exception):
+    """A safety rule said no."""
+
+
+# ---- Small helpers ----------------------------------------------------------
+
+def now():
+    return time.time()
+
+
+def log(msg):
+    line = time.strftime("%Y-%m-%dT%H:%M:%S") + " " + msg
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    print(line, file=sys.stderr)
+
+
+def run(cmd, timeout=600, check=True, input=None):
+    """Run a command (a list, never a shell string) and return the result."""
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       input=input)
+    if check and p.returncode != 0:
+        raise RuntimeError("%s failed (exit %d): %s" % (
+            " ".join(cmd), p.returncode, (p.stderr or p.stdout).strip()[-800:]))
+    return p
+
+
+def me():
+    """This node's Proxmox name (pve1 / pve2)."""
+    return socket.gethostname().split(".")[0]
+
+
+def parse_vmid(s):
+    if not re.fullmatch(r"[1-9][0-9]{2,8}", str(s)):
+        raise Refused("not a valid container ID: %r" % (s,))
+    return int(s)
+
+
+# ---- Config -----------------------------------------------------------------
+
+def load_cfg():
+    with open(CONFIG(), "rb") as f:
+        cfg = tomllib.load(f)
+    return validate_cfg(cfg)
+
+
+IPV4 = re.compile(r"(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}")
+MACRE = re.compile(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}")
+
+
+_INT = lambda lo, hi: ("int", lo, hi)        # noqa: E731
+_NAME = ("re", r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+SCHEMA = {
+    "": {"dry_run": ("bool",)},
+    "cluster": {"gateway": ("ip",), "broadcast": ("ip",), "bridge": ("re", r"[A-Za-z0-9_.-]{1,15}"),
+                "storage": _NAME, "vg": _NAME, "thinpool": _NAME,
+                "pool_max_used_pct": _INT(1, 99), "standby_offset": _INT(100, 1000000),
+                "archive_dir": ("path",), "work_dir": ("path",)},
+    "probe": {"interval": _INT(2, 300), "rounds": _INT(1, 100), "failover_delay": _INT(0, 3600),
+              "tcp_port": _INT(1, 65535), "timeout": _INT(1, 30)},
+    "policy": {"failback": ("enum", "manual", "auto", "never"),
+               "failback_stable_minutes": _INT(0, 1440), "isolation_stop_after": _INT(0, 3600),
+               "boot_wait": _INT(0, 3600), "maintenance_max_hours": _INT(1, 168),
+               "stale_factor": _INT(1, 100), "wake_on_lan": ("bool",),
+               "wake_after": _INT(0, 3600), "wake_every": _INT(30, 86400), "wake_tries": _INT(0, 100)},
+    "replication": {"bwlimit_kbps": _INT(0, 10000000), "nice": _INT(-20, 19)},
+    "controller": {"api_port": _INT(1024, 65535)},
+    "node": {"name": _NAME, "host_ip": ("ip",), "controller_id": _INT(100, 999999999),
+             "controller_ip": ("ip",), "wol_mac": ("mac",)},
+    "ct": {"id": _INT(100, 999999999), "name": ("re", r"[^\x00-\x1f]{0,64}"), "type": ("enum", "lxc"),
+           "preferred_node": _NAME, "standby_node": _NAME, "liveness_ip": ("ip",),
+           "interval_min": _INT(5, 1440), "priority": _INT(0, 999), "mode": ("enum", "off", "dry-run", "live"),
+           "standby": ("enum", "file", "container"), "start_at_boot": ("bool",)},
+}
+
+
+def _check_value(where, key, value, rule):
+    kind = rule[0]
+    ok = {"bool": lambda: isinstance(value, bool),
+          "int": lambda: isinstance(value, int) and not isinstance(value, bool) and rule[1] <= value <= rule[2],
+          "ip": lambda: isinstance(value, str) and IPV4.fullmatch(value),
+          "mac": lambda: isinstance(value, str) and MACRE.fullmatch(value),
+          "re": lambda: isinstance(value, str) and re.fullmatch(rule[1], value),
+          "enum": lambda: value in rule[1:],
+          "path": lambda: isinstance(value, str) and value.startswith("/var/lib/pve-watchdog")
+                          and ".." not in value and re.fullmatch(r"[A-Za-z0-9_./-]+", value)}[kind]()
+    if not ok:
+        raise Refused("config: %s%s has an invalid value" % (where, key))
+
+
+def validate_schema(cfg):
+    """Only known keys, each with the right type and range."""
+    for key, value in cfg.items():
+        if isinstance(value, dict):
+            if key not in SCHEMA or key in ("node", "ct"):
+                raise Refused("config: unknown section [%s]" % key)
+            for k, v in value.items():
+                if k not in SCHEMA[key]:
+                    raise Refused("config: unknown setting %s.%s" % (key, k))
+                _check_value(key + ".", k, v, SCHEMA[key][k])
+        elif isinstance(value, list):
+            if key not in ("node", "ct"):
+                raise Refused("config: unknown list [[%s]]" % key)
+            for item in value:
+                if not isinstance(item, dict):
+                    raise Refused("config: [[%s]] entries must be tables" % key)
+                for k, v in item.items():
+                    if k not in SCHEMA[key]:
+                        raise Refused("config: unknown setting %s in a [[%s]]" % (k, key))
+                    _check_value("[[%s]] " % key, k, v, SCHEMA[key][k])
+        else:
+            if key not in SCHEMA[""]:
+                raise Refused("config: unknown setting %s" % key)
+            _check_value("", key, value, SCHEMA[""][key])
+
+
+def validate_cfg(cfg):
+    """Every rule a config must follow. Used for the live config AND for any
+    config the web UI wants to save, so both are judged the same way."""
+    validate_schema(cfg)
+    if not isinstance(cfg.get("dry_run", True), bool):
+        raise Refused("config: dry_run must be true or false")
+    for n in cfg.get("node", []):
+        for k in ("name", "host_ip", "controller_ip", "controller_id"):
+            if k not in n:
+                raise Refused("config: a [[node]] is missing %s" % k)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", str(n["name"])):
+            raise Refused("config: node name %r is not a valid host name" % n["name"])
+        for k in ("host_ip", "controller_ip"):
+            if not IPV4.fullmatch(str(n[k])):
+                raise Refused("config: node %s: %s is not an IPv4 address" % (n["name"], k))
+        if not isinstance(n["controller_id"], int) or n["controller_id"] < 100:
+            raise Refused("config: node %s: controller_id must be a container ID" % n["name"])
+        if n.get("wol_mac") and not MACRE.fullmatch(str(n["wol_mac"])):
+            raise Refused("config: node %s: wol_mac is not a MAC address" % n["name"])
+    for c in cfg.get("ct", []):
+        if not isinstance(c.get("id"), int) or not 100 <= c["id"] <= 999999999:
+            raise Refused("config: a [[ct]] has an invalid id")
+        if c.get("liveness_ip") and not IPV4.fullmatch(str(c["liveness_ip"])):
+            raise Refused("config: CT %s: liveness_ip is not an IPv4 address" % c["id"])
+        iv = c.get("interval_min", 30)
+        if not isinstance(iv, int) or not 5 <= iv <= 1440:
+            raise Refused("config: CT %s: interval_min must be 5..1440" % c["id"])
+    if cfg.get("policy", {}).get("failback", "manual") not in ("manual", "auto", "never"):
+        raise Refused("config: policy.failback must be manual, auto or never")
+    names = [n["name"] for n in cfg.get("node", [])]
+    if len(names) < 2 or len(set(names)) != len(names):
+        raise Refused("config: need at least two uniquely named [[node]] blocks")
+    ids = [c["id"] for c in cfg.get("ct", [])]
+    if len(set(ids)) != len(ids):
+        raise Refused("config: a container ID is listed twice")
+    ctl_ids = {n.get("controller_id") for n in cfg["node"]}
+    for c in cfg.get("ct", []):
+        if c["id"] in ctl_ids:
+            raise Refused("config: CT %s is a controller and cannot be covered" % c["id"])
+        if c.get("type", "lxc") != "lxc":
+            raise Refused("config: CT %s: only type = \"lxc\" is supported in v1" % c["id"])
+        if c.get("preferred_node") not in names:
+            raise Refused("config: CT %s: preferred_node is not a known node" % c["id"])
+        if c.get("mode", "off") not in ("off", "dry-run", "live"):
+            raise Refused("config: CT %s: mode must be off, dry-run or live" % c["id"])
+        if c.get("standby", "file") not in ("file", "container"):
+            raise Refused("config: CT %s: standby must be \"file\" or \"container\"" % c["id"])
+        if c.get("standby") == "container":
+            sb = c["id"] + offset(cfg)
+            if sb in ids or sb in ctl_ids:
+                raise Refused("config: CT %s: its standby ID %d is already used" % (c["id"], sb))
+            sn = standby_node_name(cfg, c)
+            if sn not in names or sn == c["preferred_node"]:
+                raise Refused("config: CT %s: standby_node must be another known node" % c["id"])
+    return cfg
+
+
+# ---- True-duplicate standbys (standby = "container") -------------------------
+# The ORIGINAL (e.g. 101) lives on its preferred node; the STANDBY (101 + 1000
+# = 1101) lives on the other node, stopped, with the same MAC and IP. They never
+# move. roles.json in /etc/pve records which of the two is the active one.
+
+STANDBY_TAG = "pve-watchdog-standby"
+
+
+def offset(cfg):
+    return int(cfg.get("cluster", {}).get("standby_offset", 1000))
+
+
+def standby_node_name(cfg, ct):
+    if ct.get("standby_node"):
+        return ct["standby_node"]
+    others = [n["name"] for n in cfg.get("node", []) if n["name"] != ct.get("preferred_node")]
+    return others[0] if others else None
+
+
+def container_mode(ct):
+    return ct.get("standby", "file") == "container"
+
+
+def pair(cfg, ct):
+    """{'original': (vmid, node), 'standby': (vmid, node)} for a container-mode CT."""
+    return {"original": (ct["id"], ct["preferred_node"]),
+            "standby": (ct["id"] + offset(cfg), standby_node_name(cfg, ct))}
+
+
+def member(cfg, vmid):
+    """(ct, role, base_id) for an original or standby ID; Refused otherwise."""
+    for c in cfg.get("ct", []):
+        if c.get("mode", "off") == "off":
+            continue
+        if c["id"] == vmid:
+            return c, "original", c["id"]
+        if container_mode(c) and c["id"] + offset(cfg) == vmid:
+            return c, "standby", c["id"]
+    raise Refused("CT %s is not covered by the config (or mode = off)" % vmid)
+
+
+def ROLES():
+    return PVE + "/pve-watchdog/roles.json"
+
+
+def roles_all():
+    try:
+        with open(ROLES()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def role_active(base):
+    return roles_all().get(str(base), {}).get("active", "original")
+
+
+def role_set(base, which):
+    r = roles_all()
+    r[str(base)] = {"active": which, "since": now(), "by": me()}
+    os.makedirs(os.path.dirname(ROLES()), exist_ok=True)
+    with open(ROLES() + ".new", "w") as f:
+        json.dump(r, f)
+    os.replace(ROLES() + ".new", ROLES())
+
+
+def conf_protected(vmid):
+    try:
+        with open(conf_path(me(), vmid)) as f:
+            for line in f:
+                if line.startswith("["):
+                    break
+                if re.match(r"protection:\s*1", line):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def conf_tags(vmid):
+    try:
+        with open(conf_path(me(), vmid)) as f:
+            for line in f:
+                if line.startswith("["):
+                    break
+                if line.startswith("tags:"):
+                    return [t for t in re.split(r"[;,\s]+", line[5:].strip()) if t]
+    except OSError:
+        pass
+    return []
+
+
+def remote_status(node_name, vmid):
+    p = run(["pvesh", "get", "/nodes/%s/lxc/%d/status/current" % (node_name, vmid),
+             "--output-format", "json"], check=False, timeout=30)
+    try:
+        return json.loads(p.stdout).get("status", "unknown")
+    except ValueError:
+        return "unknown"
+
+
+def refreshed_path(vmid):
+    return "%s/refreshed-%d.json" % (VAR, vmid)
+
+
+def refreshed_meta(vmid):
+    try:
+        with open(refreshed_path(vmid)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def node(cfg, name):
+    for n in cfg["node"]:
+        if n["name"] == name:
+            return n
+    raise Refused("unknown node %r" % name)
+
+
+def peers(cfg):
+    return [n for n in cfg["node"] if n["name"] != me()]
+
+
+def covered(cfg, vmid):
+    """The config entry for vmid, or Refused if it is not covered."""
+    for c in cfg.get("ct", []):
+        if c["id"] == vmid and c.get("mode", "off") != "off":
+            if container_mode(c):
+                raise Refused("CT %s uses a standby container; this action is for "
+                              "file-mode CTs only" % vmid)
+            return c
+    raise Refused("CT %s is not covered by the config (or mode = off)" % vmid)
+
+
+def cl(cfg, key, default=None):
+    return cfg.get("cluster", {}).get(key, default)
+
+
+# ---- Facts about this host / the cluster -----------------------------------
+
+def conf_locations(vmid):
+    """Which node folder(s) in /etc/pve hold this container's config."""
+    if glob.glob("%s/nodes/*/qemu-server/%d.conf" % (PVE, vmid)):
+        raise Refused("ID %d belongs to a VM; v1 only handles containers" % vmid)
+    paths = glob.glob("%s/nodes/*/lxc/%d.conf" % (PVE, vmid))
+    return sorted(p.split("/")[-3] for p in paths)
+
+
+def conf_path(node_name, vmid):
+    return "%s/nodes/%s/lxc/%d.conf" % (PVE, node_name, vmid)
+
+
+def conf_onboot(vmid):
+    """True if this host's config for vmid has onboot: 1."""
+    try:
+        with open(conf_path(me(), vmid)) as f:
+            for line in f:
+                if line.startswith("["):
+                    break
+                if re.match(r"onboot:\s*1", line):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def ct_status_local(vmid):
+    p = run(["pct", "status", str(vmid)], check=False, timeout=30)
+    m = re.search(r"status:\s*(\w+)", p.stdout)
+    return m.group(1) if m else "unknown"
+
+
+def parse_quorum(text):
+    """Parse `pvecm status` output into a dict."""
+    q = {"quorate": False, "expected": None, "total": None, "quorum": None,
+         "members": []}
+    for line in text.splitlines():
+        m = re.match(r"\s*Quorate:\s*(\w+)", line)
+        if m:
+            q["quorate"] = m.group(1).lower() == "yes"
+        for key, label in (("expected", "Expected votes"),
+                           ("total", "Total votes"), ("quorum", "Quorum")):
+            m = re.match(r"\s*%s:\s*(\d+)" % label, line)
+            if m:
+                q[key] = int(m.group(1))
+        m = re.match(r"\s*(0x[0-9a-fA-F]+|\d+)\s+(\d+)\s+(\S+)", line)
+        if m:
+            q["members"].append({"votes": int(m.group(2)), "name": m.group(3)})
+    return q
+
+
+def quorum(cfg):
+    p = run(["pvecm", "status"], check=False, timeout=20)
+    q = parse_quorum(p.stdout)
+    # Map member names/IPs to our node names.
+    lookup = {}
+    for n in cfg["node"]:
+        lookup[n["host_ip"]] = n["name"]
+        lookup[n["name"]] = n["name"]
+    q["member_nodes"] = sorted({lookup.get(m["name"], m["name"]) for m in q["members"]})
+    return q
+
+
+def lvs_json(args):
+    p = run(["lvs", "--reportformat", "json", "--units", "b", "--nosuffix"] + args,
+            timeout=30)
+    return json.loads(p.stdout)["report"][0]["lv"]
+
+
+def pool(cfg):
+    lv = lvs_json(["-o", "lv_size,data_percent",
+                   "%s/%s" % (cl(cfg, "vg", "pve"), cl(cfg, "thinpool", "data"))])[0]
+    size = int(float(lv["lv_size"]))
+    used_pct = float(lv["data_percent"] or 0)
+    return {"size": size, "used_pct": used_pct,
+            "used": int(size * used_pct / 100), "free": int(size * (100 - used_pct) / 100)}
+
+
+def ct_volumes(cfg, vmid):
+    """All LVs in our VG named vm-<id>-disk-N, with size and used bytes."""
+    out = []
+    for lv in lvs_json(["-o", "lv_name,lv_size,data_percent", cl(cfg, "vg", "pve")]):
+        if re.fullmatch(r"vm-%d-disk-\d+" % vmid, lv["lv_name"]):
+            size = int(float(lv["lv_size"]))
+            out.append({"name": lv["lv_name"], "size": size,
+                        "used": int(size * float(lv["data_percent"] or 0) / 100)})
+    return out
+
+
+def referenced_volumes(vmid):
+    """Volumes named in this host's own config for vmid (rootfs, mp0, ...)."""
+    path = conf_path(me(), vmid)
+    if not os.path.exists(path):
+        return set()
+    names = set()
+    with open(path) as f:
+        for line in f:
+            if line.startswith("["):        # snapshot sections follow; stop
+                break
+            names.update(re.findall(r"vm-%d-disk-\d+" % vmid, line))
+    return names
+
+
+def archive_paths(cfg, vmid):
+    d = cl(cfg, "archive_dir", "/var/lib/pve-watchdog/archive")
+    return "%s/ct-%d.tar.zst" % (d, vmid), "%s/ct-%d.json" % (d, vmid)
+
+
+def archive_meta(cfg, vmid):
+    arc, meta = archive_paths(cfg, vmid)
+    if not os.path.exists(arc) or not os.path.exists(meta):
+        return None
+    with open(meta) as f:
+        m = json.load(f)
+    m["size"] = os.path.getsize(arc)
+    return m
+
+
+def ping(ip, timeout=2):
+    return run(["ping", "-c", "1", "-W", str(timeout), ip], check=False,
+               timeout=timeout + 5).returncode == 0
+
+
+def iface_ipv4(iface):
+    p = run(["ip", "-4", "-o", "addr", "show", "dev", iface], check=False)
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/", p.stdout)
+    return m.group(1) if m else None
+
+
+def arp_probe(ip, iface="vmbr0", timeout=1.0):
+    """Send one ARP 'who-has <ip>' on the bridge. True if anything answers.
+
+    Catches a container that ignores ping but is still on the network.
+    Returns None if the probe itself could not run."""
+    try:
+        with open("/sys/class/net/%s/address" % iface) as f:
+            mac = bytes.fromhex(f.read().strip().replace(":", ""))
+        src = iface_ipv4(iface)
+        if not src:
+            return None
+        tip, sip = socket.inet_aton(ip), socket.inet_aton(src)
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+        try:
+            s.bind((iface, 0))
+            s.settimeout(0.2)
+            frame = (b"\xff" * 6 + mac + struct.pack("!H", 0x0806) +
+                     struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) +
+                     mac + sip + b"\x00" * 6 + tip)
+            s.send(frame)
+            deadline = now() + timeout
+            while now() < deadline:
+                try:
+                    data = s.recv(2048)
+                except socket.timeout:
+                    continue
+                if (len(data) >= 42 and data[12:14] == b"\x08\x06"
+                        and data[20:22] == b"\x00\x02" and data[28:32] == tip):
+                    return True
+            return False
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
+def ip_alive(cfg, ip):
+    """Is something answering on this IP? (ping, then ARP).
+
+    If the ARP probe cannot run at all, we cannot prove the IP is silent, so
+    we answer "alive": that blocks start/claim instead of risking two copies."""
+    t = cfg.get("probe", {}).get("timeout", 2)
+    if ping(ip, t):
+        return True
+    arp = arp_probe(ip, cl(cfg, "bridge", "vmbr0"))
+    if arp is None:
+        log("liveness: ARP probe of %s could not run; treating it as ALIVE" % ip)
+        return True
+    return arp
+
+
+def maintenance_state():
+    try:
+        with open(MAINT()) as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        return {"active": False}
+    m["active"] = m.get("until", 0) > now()
+    return m
+
+
+# ---- The safety gate --------------------------------------------------------
+
+class Ctx:
+    """Collects safety checks and decides whether a change is really made.
+
+    live mode : the first failed check raises Refused (nothing happens).
+    dry run   : every check is recorded, nothing is run, and the report says
+                exactly which commands WOULD have run.
+    """
+
+    def __init__(self, cfg, verb, ct=None, any_live=False):
+        self.cfg, self.verb, self.ct = cfg, verb, ct
+        mode_live = (ct.get("mode") == "live") if ct else any_live
+        self.live = (not FORCE_DRY and cfg.get("dry_run", True) is False
+                     and os.path.exists(ALLOW_LIVE) and mode_live)
+        self.checks, self.would = [], []
+
+    def require(self, ok, what):
+        self.checks.append({"check": what, "ok": bool(ok)})
+        if not ok:
+            if self.live:
+                raise Refused("%s: safety check failed: %s" % (self.verb, what))
+            log("DRY-RUN %s: check would FAIL: %s" % (self.verb, what))
+
+    def cmd(self, argv, timeout=600):
+        if not self.live:
+            self.would.append(" ".join(shlex.quote(a) for a in argv))
+            log("DRY-RUN %s would run: %s" % (self.verb, self.would[-1]))
+            return None
+        log("RUN %s: %s" % (self.verb, " ".join(argv)))
+        return run(argv, timeout=timeout)
+
+    def action(self, description, fn):
+        """A Python-level change (e.g. moving a file in /etc/pve)."""
+        if not self.live:
+            self.would.append(description)
+            log("DRY-RUN %s would: %s" % (self.verb, description))
+            return None
+        log("DO %s: %s" % (self.verb, description))
+        return fn()
+
+    def result(self, **extra):
+        r = {"live": self.live, "checks": self.checks}
+        if not self.live:
+            r["dry_run"] = True
+            r["would_run"] = self.would
+        r.update(extra)
+        return r
+
+
+def with_lock(fn):
+    """Only one changing action at a time on this host."""
+    def wrapper(*a):
+        os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+        with open(LOCK, "w") as lf:
+            deadline = now() + 900
+            while True:
+                try:
+                    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if now() > deadline:
+                        raise Refused("another pve-watchdog action is still running")
+                    time.sleep(1)
+            return fn(*a)
+    return wrapper
+
+
+def park(src, vmid, from_node):
+    """Move a container config out of a node folder into pve-watchdog/parked/.
+
+    This is how a container is 'un-registered' without destroying anything:
+    the config is kept, the disks are untouched, and the ID becomes free so
+    it can be restored on another node."""
+    os.makedirs(PARKED(), exist_ok=True)
+    dst = "%s/%d.%s.%d.conf" % (PARKED(), vmid, from_node, int(now()))
+    try:
+        os.rename(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+        os.unlink(src)
+    return dst
+
+
+# ---- Verbs: read-only -------------------------------------------------------
+
+def v_status(cfg):
+    q = quorum(cfg)
+    cts = {}
+    for c in cfg.get("ct", []):
+        if c.get("mode", "off") == "off":
+            continue
+        vmid = c["id"]
+        if container_mode(c):
+            try:
+                cts[str(vmid)] = status_pair(cfg, c)
+            except Refused as e:
+                cts[str(vmid)] = {"error": str(e)}
+            continue
+        try:
+            locs = conf_locations(vmid)
+        except Refused as e:
+            cts[str(vmid)] = {"error": str(e)}
+            continue
+        entry = {"mode": c["mode"], "conf_on": locs, "local": me() in locs,
+                 "onboot": conf_onboot(vmid) if me() in locs else None,
+                 "status": ct_status_local(vmid) if me() in locs else None,
+                 "archive": archive_meta(cfg, vmid),
+                 "volumes": [v["name"] for v in ct_volumes(cfg, vmid)]}
+        cts[str(vmid)] = entry
+    try:
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+    except OSError:
+        uptime = None
+    return {"node": me(), "time": now(), "uptime": uptime,
+            "dry_run": cfg.get("dry_run", True),
+            "allow_live": os.path.exists(ALLOW_LIVE), "quorum": q,
+            "pool": pool(cfg), "cts": cts,
+            "gateway_ok": ping(cl(cfg, "gateway"), cfg.get("probe", {}).get("timeout", 2)),
+            "maintenance": maintenance_state()}
+
+
+def status_pair(cfg, c):
+    """Status of a container-mode CT: both copies + which one is active."""
+    members_out = {}
+    for role, (vmid, home) in pair(cfg, c).items():
+        locs = conf_locations(vmid)
+        local = me() in locs
+        members_out[role] = {
+            "id": vmid, "home": home, "conf_on": locs, "local": local,
+            "status": ct_status_local(vmid) if local else None,
+            "onboot": conf_onboot(vmid) if local else None,
+            "tagged": (STANDBY_TAG in conf_tags(vmid)) if local else None,
+            "refreshed": refreshed_meta(vmid) if local else None}
+    return {"mode": c["mode"], "standby": "container", "active": role_active(c["id"]),
+            "members": members_out, "archive": archive_meta(cfg, c["id"])}
+
+
+def v_get_config(cfg):
+    with open(CONFIG()) as f:
+        text = f.read()
+    secret = ""
+    if os.path.exists(SECRET()):
+        with open(SECRET()) as f:
+            secret = f.read()
+    return {"config": text, "secret": secret, "node": me()}
+
+
+def v_probe(cfg, ip):
+    allowed = {cl(cfg, "gateway")}
+    allowed |= {c["liveness_ip"] for c in cfg.get("ct", []) if c.get("liveness_ip")}
+    allowed |= {n["host_ip"] for n in cfg["node"]} | {n["controller_ip"] for n in cfg["node"]}
+    if ip not in allowed:
+        raise Refused("probe: %s is not an address from the config" % ip)
+    t = cfg.get("probe", {}).get("timeout", 2)
+    return {"ip": ip, "ping": ping(ip, t), "arp": arp_probe(ip, cl(cfg, "bridge", "vmbr0"))}
+
+
+# ---- Verbs: changing --------------------------------------------------------
+
+@with_lock
+def v_backup(cfg, vmid, mode="snapshot"):
+    """Make a verified backup of a container that runs on THIS node.
+
+    For a standby pair, either copy can be backed up; the archive is always
+    named after the original ID (ct-101.tar.zst)."""
+    vmid = parse_vmid(vmid)
+    ct, role, base = member(cfg, vmid)
+    x = Ctx(cfg, "backup", ct)
+    x.require(mode in ("snapshot", "stop"), "mode is snapshot or stop")
+    x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    work = cl(cfg, "work_dir", "/var/lib/pve-watchdog/work")
+    arc, meta = archive_paths(cfg, base)
+    rep = cfg.get("replication", {})
+    argv = ["nice", "-n", str(rep.get("nice", 10)), "ionice", "-c", "3",
+            "vzdump", str(vmid), "--mode", mode, "--compress", "zstd",
+            "--dumpdir", work, "--bwlimit", str(rep.get("bwlimit_kbps", 51200)),
+            "--remove", "0"]
+    if x.live:
+        os.makedirs(work, exist_ok=True)
+        os.makedirs(os.path.dirname(arc), exist_ok=True)
+        for old in glob.glob("%s/vzdump-lxc-%d-*" % (work, vmid)):
+            os.unlink(old)
+    used = sum(v["used"] for v in ct_volumes(cfg, vmid) if v["name"] in referenced_volumes(vmid))
+    x.cmd(argv, timeout=6 * 3600)
+    if not x.live:
+        x.would.append("zstd -t <new archive>; replace %s atomically; write %s" % (arc, meta))
+        return x.result()
+    made = sorted(glob.glob("%s/vzdump-lxc-%d-*.tar.zst" % (work, vmid)))
+    if not made:
+        raise RuntimeError("vzdump finished but no archive was found")
+    new = made[-1]
+    run(["zstd", "-q", "-t", new], timeout=3600)          # verify before using it
+    os.replace(new, arc + ".new")
+    os.replace(arc + ".new", arc)
+    m = {"vmid": base, "source": vmid, "node": me(), "created": now(), "mode": mode,
+         "used_bytes": used, "verified": True}
+    with open(meta + ".new", "w") as f:
+        json.dump(m, f)
+    os.replace(meta + ".new", meta)
+    for leftover in glob.glob("%s/vzdump-lxc-%d-*" % (work, vmid)):
+        os.unlink(leftover)
+    log("backup %d ok: %s (%d bytes)" % (vmid, arc, os.path.getsize(arc)))
+    return x.result(archive=archive_meta(cfg, base))
+
+
+@with_lock
+def v_push(cfg, vmid, target):
+    """Copy this node's latest verified backup of vmid to another node."""
+    vmid = parse_vmid(vmid)
+    ct, role, vmid = member(cfg, vmid)            # always work with the base ID
+    x = Ctx(cfg, "push", ct)
+    t = node(cfg, target)
+    x.require(target != me(), "target is another node")
+    if container_mode(ct):
+        act = role_active(vmid)
+        act_id = pair(cfg, ct)[act][0]
+        x.require(conf_locations(act_id) == [me()],
+                  "the ACTIVE copy (%s, CT %d) is registered on this node" % (act, act_id))
+    else:
+        x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    m = archive_meta(cfg, vmid)
+    x.require(m is not None, "a verified local backup of CT %d exists" % vmid)
+    arc, meta = archive_paths(cfg, vmid)
+    adir = os.path.dirname(arc)
+    host = "root@" + t["host_ip"]
+    # Same host-key check Proxmox uses for its own migrations: the target's
+    # key as stored in the cluster filesystem, under the node's name.
+    sshopts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+               "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlias=" + target,
+               "-o", "UserKnownHostsFile=%s/nodes/%s/ssh_known_hosts" % (PVE, target)]
+    ssh = ["ssh"] + sshopts + [host]
+    rsh = " ".join(["ssh"] + sshopts)
+    if x.live:
+        p = run(ssh + ["mkdir -p %s && df --output=avail -B1 %s | tail -1"
+                       % (shlex.quote(adir), shlex.quote(adir))], timeout=60)
+        avail = int(p.stdout.strip().splitlines()[-1])
+        x.require(avail > m["size"] * 1.2,
+                  "target has room for the backup (%d bytes free)" % avail)
+    bw = str(cfg.get("replication", {}).get("bwlimit_kbps", 51200))
+    x.cmd(["rsync", "-t", "--bwlimit=" + bw, "-e", rsh,
+           arc, "%s:%s.part" % (host, arc)], timeout=6 * 3600)
+    x.cmd(["rsync", "-t", "-e", rsh,
+           meta, "%s:%s.part" % (host, meta)], timeout=300)
+    # Verify on the far side, then swap in atomically.
+    x.cmd(ssh + ["zstd -q -t {a}.part && mv -f {a}.part {a} && mv -f {m}.part {m}".format(
+        a=shlex.quote(arc), m=shlex.quote(meta))], timeout=3600)
+    return x.result(target=target)
+
+
+@with_lock
+def v_start(cfg, vmid):
+    vmid = parse_vmid(vmid)
+    ct = covered(cfg, vmid)                       # pairs start through `activate`
+    x = Ctx(cfg, "start", ct)
+    x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    x.require(ct_status_local(vmid) == "stopped", "CT %d is stopped here" % vmid)
+    if ct.get("liveness_ip"):
+        x.require(not ip_alive(cfg, ct["liveness_ip"]),
+                  "nothing else answers on %s (no other live copy)" % ct["liveness_ip"])
+    x.cmd(["pct", "start", str(vmid)], timeout=300)
+    return x.result()
+
+
+@with_lock
+def v_stop(cfg, vmid):
+    vmid = parse_vmid(vmid)
+    ct, _role, _base = member(cfg, vmid)
+    x = Ctx(cfg, "stop", ct)
+    x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    if x.live and ct_status_local(vmid) == "stopped":
+        return x.result(note="already stopped")
+    if x.live:
+        log("RUN stop: pct shutdown %d --timeout 60" % vmid)
+        p = run(["pct", "shutdown", str(vmid), "--timeout", "60"], check=False, timeout=120)
+        if p.returncode != 0:
+            log("stop %d: clean shutdown failed, forcing stop" % vmid)
+            x.cmd(["pct", "stop", str(vmid)], timeout=120)
+        return x.result()
+    x.cmd(["pct", "shutdown", str(vmid), "--timeout", "60"])
+    return x.result()
+
+
+@with_lock
+def v_adopt(cfg, vmid):
+    """Hand boot decisions to the tool: set onboot 0 on a covered CT here.
+
+    Without this, Proxmox would autostart the CT at boot BEFORE the
+    controller can check that no other copy is running."""
+    vmid = parse_vmid(vmid)
+    ct, _role, _base = member(cfg, vmid)
+    x = Ctx(cfg, "adopt", ct)
+    x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    x.cmd(["pct", "set", str(vmid), "--onboot", "0"], timeout=60)
+    return x.result()
+
+
+@with_lock
+def v_force_quorum(cfg):
+    """Two-node only: tell corosync to accept 1 expected vote (force mode)."""
+    any_live = any(c.get("mode") == "live" for c in cfg.get("ct", []))
+    x = Ctx(cfg, "force-quorum", None, any_live=any_live)
+    x.require(len(cfg["node"]) == 2, "this is a two-node setup")
+    q = quorum(cfg)
+    if q["quorate"]:
+        return x.result(note="already quorate, nothing to do")
+    peer = peers(cfg)[0]
+    x.require(peer["name"] not in q["member_nodes"], "peer is not a cluster member")
+    x.require(not ping(peer["host_ip"]), "peer host does not answer ping")
+    x.require(ping(cl(cfg, "gateway")), "this node can reach the gateway")
+    x.cmd(["pvecm", "expected", "1"], timeout=30)
+    if not x.live:
+        return x.result()
+    for _ in range(60):                       # quorum takes a few seconds to apply
+        if quorum(cfg)["quorate"]:
+            log("force-quorum: Quorate: Yes")
+            return x.result(quorate=True)
+        time.sleep(1)
+    raise RuntimeError("pvecm expected 1 ran but the node never became quorate")
+
+
+@with_lock
+def v_claim(cfg, vmid, from_node):
+    """Take over a container whose node is DEAD: park its config entry.
+
+    Afterwards the ID is free and 'restore' can bring it up here."""
+    vmid = parse_vmid(vmid)
+    ct = covered(cfg, vmid)
+    x = Ctx(cfg, "claim", ct)
+    src_node = node(cfg, from_node)
+    x.require(from_node != me(), "claiming from another node")
+    x.require(conf_locations(vmid) == [from_node], "CT %d is registered on %s" % (vmid, from_node))
+    q = quorum(cfg)
+    x.require(q["quorate"], "this node is quorate")
+    x.require(from_node not in q["member_nodes"], "%s is not a cluster member" % from_node)
+    x.require(not ping(src_node["host_ip"]), "%s does not answer ping" % from_node)
+    if ct.get("liveness_ip"):
+        x.require(not ip_alive(cfg, ct["liveness_ip"]),
+                  "CT %d's own IP %s does not answer" % (vmid, ct["liveness_ip"]))
+    x.require(archive_meta(cfg, vmid) is not None, "a local backup of CT %d exists" % vmid)
+    src = conf_path(from_node, vmid)
+    dst = x.action("park %s into %s/" % (src, PARKED()), lambda: park(src, vmid, from_node))
+    return x.result(parked=dst)
+
+
+@with_lock
+def v_release(cfg, vmid):
+    """Planned hand-over (failback): un-register a STOPPED container here."""
+    vmid = parse_vmid(vmid)
+    ct = covered(cfg, vmid)
+    x = Ctx(cfg, "release", ct)
+    x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    x.require(ct_status_local(vmid) == "stopped", "CT %d is stopped" % vmid)
+    m = archive_meta(cfg, vmid)
+    x.require(m is not None and m.get("mode") == "stop" and now() - m["created"] < 3600,
+              "a fresh stop-mode backup of CT %d exists" % vmid)
+    q = quorum(cfg)
+    x.require(q["quorate"] and len(q["member_nodes"]) >= 2,
+              "cluster is quorate with the peer present")
+    src = conf_path(me(), vmid)
+    dst = x.action("park %s into %s/" % (src, PARKED()), lambda: park(src, vmid, me()))
+    return x.result(parked=dst)
+
+
+@with_lock
+def v_restore(cfg, vmid):
+    """Bring a container up on THIS node from its latest verified backup."""
+    vmid = parse_vmid(vmid)
+    ct = covered(cfg, vmid)
+    x = Ctx(cfg, "restore", ct)
+    x.require(conf_locations(vmid) == [], "ID %d is not registered on any node" % vmid)
+    x.require(quorum(cfg)["quorate"], "this node is quorate")
+    m = archive_meta(cfg, vmid)
+    x.require(m is not None, "a local backup of CT %d exists" % vmid)
+    arc, _ = archive_paths(cfg, vmid)
+    if m is not None:
+        p = pool(cfg)
+        after = (p["used"] + m.get("used_bytes", 0)) * 100.0 / p["size"]
+        limit = cl(cfg, "pool_max_used_pct", 80)
+        x.require(after <= limit, "thin pool would be %.1f%% used (limit %s%%)" % (after, limit))
+        if x.live:
+            run(["zstd", "-q", "-t", arc], timeout=3600)
+    x.cmd(["pct", "restore", str(vmid), arc, "--storage", cl(cfg, "storage", "local-lvm")],
+          timeout=6 * 3600)
+    # A restore carries onboot: 1 from the original; the tool decides boots.
+    x.cmd(["pct", "set", str(vmid), "--onboot", "0"], timeout=60)
+    return x.result(archive=m)
+
+
+@with_lock
+def v_free_orphans(cfg, vmid):
+    """Delete leftover disks of vmid on THIS node that no config uses any more.
+
+    Only when the container is confirmed running (here on other disks, or on
+    a cluster member) and a backup exists, so the only copy is never deleted."""
+    vmid = parse_vmid(vmid)
+    ct = covered(cfg, vmid)
+    x = Ctx(cfg, "free-orphans", ct)
+    locs = conf_locations(vmid)
+    x.require(len(locs) == 1, "CT %d is registered on exactly one node" % vmid)
+    q = quorum(cfg)
+    x.require(q["quorate"], "this node is quorate")
+    running = False
+    if locs == [me()]:
+        running = ct_status_local(vmid) == "running"
+    elif len(locs) == 1 and locs[0] in q["member_nodes"]:
+        p = run(["pvesh", "get", "/nodes/%s/lxc/%d/status/current" % (locs[0], vmid),
+                 "--output-format", "json"], check=False, timeout=30)
+        try:
+            running = json.loads(p.stdout).get("status") == "running"
+        except ValueError:
+            running = False
+    x.require(running, "CT %d is confirmed running" % vmid)
+    x.require(archive_meta(cfg, vmid) is not None, "a local backup of CT %d exists" % vmid)
+    keep = referenced_volumes(vmid)
+    orphans = [v["name"] for v in ct_volumes(cfg, vmid) if v["name"] not in keep]
+    storage = cl(cfg, "storage", "local-lvm")
+    for o in orphans:
+        x.cmd(["pvesm", "free", "%s:%s" % (storage, o)], timeout=300)
+    return x.result(orphans=orphans)
+
+
+@with_lock
+def v_refresh(cfg, vmid):
+    """Rewrite the STOPPED copy of a pair on this node from the latest backup.
+
+    Used to keep the standby (e.g. 1101) up to date, and during failback to
+    bring the original (101) up to date from the standby's final backup.
+    Creates the standby the first time if it does not exist yet."""
+    vmid = parse_vmid(vmid)
+    ct, role, base = member(cfg, vmid)
+    x = Ctx(cfg, "refresh", ct)
+    x.require(container_mode(ct), "CT %d uses a standby container" % base)
+    home = pair(cfg, ct)[role][1] if container_mode(ct) else None
+    x.require(home == me(), "CT %d belongs on this node (%s)" % (vmid, home))
+    locs = conf_locations(vmid)
+    creating = locs == [] and role == "standby"
+    x.require(creating or locs == [me()], "CT %d is registered here (or is a new standby)" % vmid)
+    if not creating and locs == [me()]:
+        x.require(ct_status_local(vmid) == "stopped", "CT %d is stopped" % vmid)
+    x.require(role_active(base) != role, "the OTHER copy is the active one, so this copy "
+                                         "may be overwritten")
+    m = archive_meta(cfg, base)
+    x.require(m is not None, "a verified backup of CT %d is here" % base)
+    arc, _ = archive_paths(cfg, base)
+    if m is not None:
+        p = pool(cfg)
+        current = sum(v["used"] for v in ct_volumes(cfg, vmid))
+        after = (p["used"] - current + m.get("used_bytes", 0)) * 100.0 / p["size"]
+        limit = cl(cfg, "pool_max_used_pct", 80)
+        x.require(after <= limit, "thin pool would be %.1f%% used (limit %s%%)" % (after, limit))
+        if x.live:
+            run(["zstd", "-q", "-t", arc], timeout=3600)
+    argv = ["pct", "restore", str(vmid), arc, "--storage", cl(cfg, "storage", "local-lvm")]
+    lifted = False
+    if not creating:
+        argv += ["--force", "1"]
+        # Proxmox's "protection" flag blocks overwriting. It is lifted only on
+        # a copy this tool owns: a standby that carries our tag, or the
+        # original while it is being failed back to (the only time it is
+        # overwritten; all guards above passed). The restore brings back the
+        # original's own protection setting from the backup.
+        if conf_protected(vmid):
+            if role == "standby":
+                x.require(STANDBY_TAG in conf_tags(vmid),
+                          "protected CT %d carries the %s tag" % (vmid, STANDBY_TAG))
+            x.cmd(["pct", "set", str(vmid), "--protection", "0"], timeout=60)
+            lifted = x.live
+    try:
+        x.cmd(argv, timeout=6 * 3600)
+    except Exception:
+        if lifted:                        # restore failed: put protection back
+            run(["pct", "set", str(vmid), "--protection", "1"], check=False, timeout=60)
+            log("refresh %d failed; protection restored" % vmid)
+        raise
+    x.cmd(["pct", "set", str(vmid), "--onboot", "0"], timeout=60)
+    if role == "standby":
+        tags = conf_tags(vmid) if x.live else []
+        if STANDBY_TAG not in tags:
+            tags.append(STANDBY_TAG)
+        x.cmd(["pct", "set", str(vmid), "--tags", ";".join(tags)], timeout=60)
+    if x.live:
+        with open(refreshed_path(vmid), "w") as f:
+            json.dump({"vmid": vmid, "archive_created": m["created"], "at": now()}, f)
+        log("refresh %d ok from backup made %s" % (vmid, time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(m["created"]))))
+    return x.result(archive=m)
+
+
+@with_lock
+def v_activate(cfg, base, which):
+    """Make one copy of a pair the live one: record it in roles.json, start it.
+
+    Refused if the other copy is running, if its node is alive but cannot be
+    checked, or if anything already answers on the CT's IP."""
+    base = parse_vmid(base)
+    ct, _role, base = member(cfg, base)
+    x = Ctx(cfg, "activate", ct)
+    x.require(container_mode(ct), "CT %d uses a standby container" % base)
+    x.require(which in ("original", "standby"), "which is original or standby")
+    if not container_mode(ct) or which not in ("original", "standby"):
+        return x.result()
+    members_ = pair(cfg, ct)
+    vmid, home = members_[which]
+    other = "standby" if which == "original" else "original"
+    other_id, other_home = members_[other]
+    x.require(home == me(), "CT %d (%s) belongs on this node" % (vmid, which))
+    x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    status = ct_status_local(vmid)
+    if x.live and status == "running" and role_active(base) == which:
+        return x.result(note="already active and running")
+    x.require(status == "stopped", "CT %d is stopped" % vmid)
+    q = quorum(cfg)
+    x.require(q["quorate"], "this node is quorate")
+    if other_home in q["member_nodes"]:
+        x.require(remote_status(other_home, other_id) == "stopped",
+                  "the other copy (CT %d on %s) is stopped" % (other_id, other_home))
+    else:
+        x.require(not ping(node(cfg, other_home)["host_ip"]),
+                  "%s (home of the other copy) is not a cluster member and does not "
+                  "answer ping" % other_home)
+    if ct.get("liveness_ip"):
+        x.require(not ip_alive(cfg, ct["liveness_ip"]),
+                  "nothing else answers on %s (no other live copy)" % ct["liveness_ip"])
+    x.action("record %s copy (CT %d) as active in %s" % (which, vmid, ROLES()),
+             lambda: role_set(base, which))
+    x.cmd(["pct", "start", str(vmid)], timeout=300)
+    return x.result(active=which, vmid=vmid)
+
+
+# ---- Verbs used by the web UI ----------------------------------------------
+
+STDIN = ""          # set by main() for verbs that take their data on stdin
+HISTORY_KEEP = 10
+
+
+def HISTORY():
+    return PVE + "/pve-watchdog/history"
+
+
+def cluster_guests():
+    p = run(["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
+            timeout=60)
+    return json.loads(p.stdout)
+
+
+def v_list_guests(cfg):
+    """Every container and VM in the cluster, with what pve-watchdog thinks of it."""
+    ctl = {n["controller_id"]: n["name"] for n in cfg["node"]}
+    covered = {c["id"]: c for c in cfg.get("ct", [])}
+    standby_of = {c["id"] + offset(cfg): c["id"] for c in cfg.get("ct", []) if container_mode(c)}
+    out = []
+    for r in cluster_guests():
+        vmid, kind = int(r["vmid"]), r.get("type")
+        g = {"id": vmid, "type": kind, "node": r.get("node"), "name": r.get("name", ""),
+             "status": r.get("status"), "tags": r.get("tags", ""), "ip": None,
+             "role": "controller" if vmid in ctl else
+                     "standby" if vmid in standby_of else
+                     "covered" if vmid in covered else None,
+             "standby_of": standby_of.get(vmid)}
+        if kind == "lxc":
+            p = run(["pvesh", "get", "/nodes/%s/lxc/%d/config" % (r["node"], vmid),
+                     "--output-format", "json"], check=False, timeout=30)
+            try:
+                net0 = json.loads(p.stdout).get("net0", "")
+                m = re.search(r"ip=(\d+\.\d+\.\d+\.\d+)", net0)
+                g["ip"] = m.group(1) if m else None
+            except ValueError:
+                pass
+        out.append(g)
+    return sorted(out, key=lambda g: g["id"])
+
+
+def _write_config_with_history(text, who):
+    os.makedirs(HISTORY(), exist_ok=True)
+    if os.path.exists(CONFIG()):
+        shutil.copy2(CONFIG(), "%s/config-%d.toml" % (HISTORY(), int(now())))
+    old = sorted(glob.glob(HISTORY() + "/config-*.toml"))
+    for f in old[:-HISTORY_KEEP]:
+        os.unlink(f)
+    with open(CONFIG() + ".new", "w") as f:
+        f.write(text)
+    os.replace(CONFIG() + ".new", CONFIG())
+    log("config saved by %s" % who)
+
+
+@with_lock
+def v_put_config(cfg, who):
+    """Replace config.toml with the text on stdin, after full validation."""
+    who = re.sub(r"[^A-Za-z0-9@._-]", "", who)[:64] or "?"
+    try:
+        new = tomllib.loads(STDIN)
+    except tomllib.TOMLDecodeError as e:
+        raise Refused("not valid TOML: %s" % e)
+    validate_cfg(new)
+    # Each covered guest must exist as a container (or already be covered:
+    # during a takeover a file-mode CT can briefly be registered nowhere).
+    kinds = {int(r["vmid"]): r.get("type") for r in cluster_guests()}
+    before = {c["id"] for c in cfg.get("ct", [])}
+    for c in new.get("ct", []):
+        if c.get("mode", "off") == "off" or c["id"] in before:
+            continue
+        if kinds.get(c["id"]) != "lxc":
+            raise Refused("CT %d is not a container in this cluster%s" % (
+                c["id"], " (VMs are not supported yet)" if kinds.get(c["id"]) == "qemu" else ""))
+    _write_config_with_history(STDIN, who)
+    return {"saved": True}
+
+
+def v_config_history(cfg):
+    out = []
+    for f in sorted(glob.glob(HISTORY() + "/config-*.toml"), reverse=True):
+        out.append({"ts": int(re.search(r"config-(\d+)\.toml", f).group(1)),
+                    "size": os.path.getsize(f)})
+    return out
+
+
+@with_lock
+def v_restore_config(cfg, ts, who):
+    ts = int(parse_vmid(ts)) if not str(ts).isdigit() else int(ts)
+    path = "%s/config-%d.toml" % (HISTORY(), ts)
+    if not os.path.exists(path):
+        raise Refused("no saved config from %s" % ts)
+    with open(path) as f:
+        text = f.read()
+    validate_cfg(tomllib.loads(text))
+    _write_config_with_history(text, re.sub(r"[^A-Za-z0-9@._-]", "", who)[:64] + " (restore)")
+    return {"restored": ts}
+
+
+@with_lock
+def v_put_secret(cfg, key):
+    """Set one value in the root-only secret file (value on stdin)."""
+    if key != "discord_webhook":
+        raise Refused("only discord_webhook can be set")
+    value = STDIN.strip()
+    if value and not re.fullmatch(r"https://(discord|discordapp)\.com/api/webhooks/\d+/[A-Za-z0-9_-]+",
+                                  value):
+        raise Refused("that is not a Discord webhook URL")
+    text = open(SECRET()).read() if os.path.exists(SECRET()) else ""
+    line = 'discord_webhook = "%s"' % value
+    if re.search(r"(?m)^discord_webhook\s*=.*$", text):
+        text = re.sub(r"(?m)^discord_webhook\s*=.*$", line, text)
+    else:
+        text = text.rstrip("\n") + "\n" + line + "\n"
+    tomllib.loads(text)
+    with open(SECRET(), "w") as f:
+        f.write(text)
+    log("secret %s %s" % (key, "set" if value else "cleared"))
+    return {"set": bool(value)}
+
+
+def v_check_login(cfg):
+    """Check a Proxmox username/password (JSON on stdin) against THIS host's
+    own Proxmox API. Only says yes/no and whether the user is an admin; the
+    Proxmox ticket is never passed on."""
+    import hashlib
+    import http.client
+    import ssl
+    import urllib.parse
+    try:
+        data = json.loads(STDIN)
+        user, password = str(data["username"]).strip(), str(data["password"])
+    except (ValueError, KeyError):
+        raise Refused("expected {username, password}")
+    if "@" not in user:
+        user += "@pam"
+    # The certificate pveproxy serves must be exactly the one on this host's
+    # disk (custom pveproxy-ssl.pem if present, else the cluster-issued
+    # pve-ssl.pem). Pinning it avoids any reliance on host names or CAs.
+    pem = "%s/local/pveproxy-ssl.pem" % PVE
+    if not os.path.exists(pem):
+        pem = "%s/local/pve-ssl.pem" % PVE
+    with open(pem) as f:
+        expected = hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).digest()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE        # replaced by the exact pin check below
+    conn = http.client.HTTPSConnection("127.0.0.1", 8006, context=ctx, timeout=15)
+    try:
+        conn.connect()
+        if hashlib.sha256(conn.sock.getpeercert(binary_form=True)).digest() != expected:
+            raise Refused("the Proxmox API certificate does not match this host's own; "
+                          "refusing to send the password")
+        body = urllib.parse.urlencode({"username": user, "password": password})
+        conn.request("POST", "/api2/json/access/ticket", body,
+                     {"Content-Type": "application/x-www-form-urlencoded"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        safe_user = re.sub(r"[^A-Za-z0-9@._-]", "", user)[:64]
+        if resp.status != 200:
+            log("web UI login refused for %s" % safe_user)
+            return {"ok": False}
+        d = json.loads(raw).get("data") or {}
+        # An account with two-factor auth only gets a half ticket here: refuse.
+        if d.get("NeedTFA") or not d.get("ticket") or str(d.get("ticket")).find("!tfa!") >= 0:
+            log("web UI login for %s needs two-factor; not supported" % safe_user)
+            return {"ok": False, "tfa": True}
+        # Real permissions on the cluster root, not the summary hints.
+        conn.request("GET", "/api2/json/access/permissions?path=%2F", headers={
+            "Cookie": "PVEAuthCookie=" + urllib.parse.quote(d["ticket"], safe="")})
+        presp = conn.getresponse()
+        perms = (json.loads(presp.read()).get("data") or {}).get("/", {}) if presp.status == 200 else {}
+    finally:
+        conn.close()
+    admin = bool(perms.get("Sys.Modify")) and bool(perms.get("VM.PowerMgmt")) and \
+        bool(perms.get("VM.Allocate"))
+    log("web UI login ok for %s (admin=%s)" % (d.get("username"), admin))
+    return {"ok": True, "user": d.get("username", user), "admin": admin}
+
+
+def v_maintenance(cfg, what, seconds=None):
+    """Cluster-wide maintenance flag in /etc/pve (needs quorum to write).
+
+    Not gated by dry-run: it only ever SUPPRESSES actions."""
+    if what == "off":
+        if os.path.exists(MAINT()):
+            os.unlink(MAINT())
+        log("maintenance off")
+        return {"active": False}
+    if what != "on":
+        raise Refused("maintenance on <seconds> | off")
+    secs = int(seconds or 3600)
+    cap = int(cfg.get("policy", {}).get("maintenance_max_hours", 8) * 3600)
+    secs = max(60, min(secs, cap))
+    m = {"until": now() + secs, "set_by": me(), "set_at": now()}
+    os.makedirs(os.path.dirname(MAINT()), exist_ok=True)
+    with open(MAINT(), "w") as f:
+        json.dump(m, f)
+    log("maintenance on for %d s" % secs)
+    m["active"] = True
+    return m
+
+
+VERBS = {
+    # name           (function,        number of arguments allowed)
+    "status":        (v_status,        (0,)),
+    "get-config":    (v_get_config,    (0,)),
+    "probe":         (v_probe,         (1,)),
+    "backup":        (v_backup,        (1, 2)),
+    "push":          (v_push,          (2,)),
+    "start":         (v_start,         (1,)),
+    "stop":          (v_stop,          (1,)),
+    "adopt":         (v_adopt,         (1,)),
+    "refresh":       (v_refresh,       (1,)),
+    "list-guests":   (v_list_guests,   (0,)),
+    "put-config":    (v_put_config,    (1,)),     # config text on stdin
+    "config-history": (v_config_history, (0,)),
+    "restore-config": (v_restore_config, (2,)),
+    "put-secret":    (v_put_secret,    (1,)),     # value on stdin
+    "check-login":   (v_check_login,   (0,)),     # {username, password} on stdin
+    "activate":      (v_activate,      (2,)),
+    "force-quorum":  (v_force_quorum,  (0,)),
+    "claim":         (v_claim,         (2,)),
+    "release":       (v_release,       (1,)),
+    "restore":       (v_restore,       (1,)),
+    "free-orphans":  (v_free_orphans,  (1,)),
+    "maintenance":   (v_maintenance,   (1, 2)),
+}
+
+
+def main(argv):
+    # When called through the locked-down SSH key, the requested command
+    # arrives in SSH_ORIGINAL_COMMAND; when run by hand, in argv.
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND")
+    words = shlex.split(raw) if raw is not None else argv[1:]
+    if words and os.path.basename(words[0]) == "pve-watchdog-hostcmd":
+        words = words[1:]
+    global FORCE_DRY
+    if words and words[0] == "--dry-run":      # "show me, change nothing"
+        FORCE_DRY = True
+        words = words[1:]
+    global STDIN
+    if words and words[0] in ("put-config", "put-secret", "check-login"):
+        STDIN = sys.stdin.read(256 * 1024)        # never logged
+    if not words or words[0] not in VERBS:
+        print(json.dumps({"ok": False, "error": "unknown verb; allowed: " + ", ".join(VERBS)}))
+        return 2
+    fn, nargs = VERBS[words[0]]
+    args = words[1:]
+    if len(args) not in nargs:
+        print(json.dumps({"ok": False, "error": "wrong number of arguments"}))
+        return 2
+    try:
+        cfg = load_cfg()
+        result = fn(cfg, *args)
+        print(json.dumps({"ok": True, "result": result}))
+        return 0
+    except Refused as e:
+        log("REFUSED %s: %s" % (" ".join(words), e))
+        print(json.dumps({"ok": False, "refused": True, "error": str(e)}))
+        return 3
+    except Exception as e:                       # report, never hang the brain
+        log("ERROR %s: %s" % (" ".join(words), e))
+        print(json.dumps({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

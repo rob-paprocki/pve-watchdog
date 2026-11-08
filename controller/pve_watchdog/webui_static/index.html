@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pve-watchdog</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">pve-watchdog <span id="node" class="muted"></span></div>
+    <nav id="tabs" hidden>
+      <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="guests">Guests</button>
+      <button data-tab="nodes">Nodes</button>
+      <button data-tab="settings">Settings</button>
+      <button data-tab="history">History</button>
+    </nav>
+    <div class="who">
+      <button id="theme" title="Colour theme: Auto follows your system">Auto</button>
+      <span id="user" class="muted"></span> <button id="logout" class="link" hidden>Log out</button>
+    </div>
+  </header>
+
+  <div id="banner" hidden></div>
+
+  <main id="main">
+    <section id="login" class="card narrow" hidden>
+      <h2>Sign in</h2>
+      <p class="muted">Use a Proxmox administrator account, for example <code>root@pam</code>.
+        Accounts with two-factor login can't sign in here yet.</p>
+      <form id="login-form">
+        <label>User <input name="username" autocomplete="username" value="root@pam" required></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit" class="primary">Sign in</button>
+        <p id="login-error" class="error" hidden></p>
+      </form>
+    </section>
+    <section id="view"></section>
+  </main>
+
+  <footer class="muted" id="footer"></footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

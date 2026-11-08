@@ -1,0 +1,15 @@
+# The watcher: probes peers every 10 s and decides on takeover/failback.
+[Unit]
+Description=pve-watchdog controller (watcher + peer API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pve-watchdog
+ExecStart=/usr/bin/python3 -m pve_watchdog daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

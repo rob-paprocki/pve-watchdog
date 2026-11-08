@@ -1,0 +1,10 @@
+# Every minute: check whether any CT is due for its (30-minute) copy.
+[Unit]
+Description=pve-watchdog replication timer
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target

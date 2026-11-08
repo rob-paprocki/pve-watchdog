@@ -1,0 +1,8 @@
+# One replication pass: copies every CT that is due (started by the timer).
+[Unit]
+Description=pve-watchdog replication pass
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pve-watchdog
+ExecStart=/usr/bin/python3 -m pve_watchdog sync

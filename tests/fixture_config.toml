@@ -1,0 +1,128 @@
+# pve-watchdog configuration
+#
+# Installed location: /etc/pve/pve-watchdog/config.toml
+# /etc/pve is Proxmox's cluster filesystem, so every node sees the same file,
+# and it stays readable even when a node has lost quorum.
+#
+# Secrets (Discord webhook URL, controller signing key) do NOT go here.
+# They live in /etc/pve/priv/pve-watchdog.secret.toml, which only root can read.
+
+# Master safety switch. While true, nothing is changed anywhere: every
+# action is only printed/logged as "DRY-RUN would run: ...".
+# Each host ALSO needs the file /etc/pve-watchdog/allow-live before it will
+# change anything, and each container needs mode = "live" (see [[ct]]).
+dry_run = true
+
+[cluster]
+gateway = "192.168.100.1"         # "am I the isolated one?" check
+storage = "local-lvm"           # where restores are written
+vg = "pve"                      # LVM volume group (read-only use: free space checks)
+thinpool = "data"
+pool_max_used_pct = 80          # refuse a restore that would push the pool past this
+archive_dir = "/var/lib/pve-watchdog/archive"   # on each HOST: latest verified backup per CT
+work_dir = "/var/lib/pve-watchdog/work"         # on each HOST: vzdump scratch space
+
+[probe]
+interval = 10           # seconds between probe rounds
+rounds = 6              # consecutive fully-failed rounds before the peer is "down"
+failover_delay = 90     # extra seconds to wait after "down" before taking over
+tcp_port = 8006         # Proxmox web UI port, one of the probe signals
+timeout = 2             # seconds per individual probe
+
+[policy]
+failback = "auto"               # manual | auto | never
+failback_stable_minutes = 10    # preferred node must be healthy this long first
+isolation_stop_after = 120      # seconds; a node that can reach NEITHER the gateway
+                                # NOR any peer stops its covered CTs, so the peer can
+                                # take over without two copies running. 0 = disabled.
+boot_wait = 120                 # at boot, wait up to this long to contact the peer
+maintenance_max_hours = 8       # maintenance mode always expires by itself
+stale_factor = 3                # warn when a copy is older than 3 x its interval
+wake_on_lan = true              # send a Wake-on-LAN packet to a peer that is down
+wake_after = 60                 # ...this many seconds after it was declared down
+wake_every = 300                # ...repeat every 5 minutes
+wake_tries = 6                  # ...at most 6 times (never during maintenance)
+
+[replication]
+bwlimit_kbps = 51200    # vzdump + rsync bandwidth cap, KiB/s (50 MiB/s)
+nice = 10               # CPU priority for backups (higher = gentler)
+
+[controller]
+api_port = 8787         # controllers talk to each other on this port (signed)
+
+# ---- Nodes -----------------------------------------------------------------
+# Every node that runs a controller. A future third node is just another block.
+[[node]]
+name = "pve1"
+host_ip = "192.168.100.249"
+controller_id = 9100
+controller_ip = "192.168.100.243"
+wol_mac = "00:00:5e:00:53:01"     # wired NIC, for Wake-on-LAN
+
+[[node]]
+name = "pve2"
+host_ip = "192.168.100.250"
+controller_id = 9101
+controller_ip = "192.168.100.244"
+wol_mac = "00:00:5e:00:53:02"
+
+# ---- Covered containers ----------------------------------------------------
+# mode = "off"     : ignored completely (as if not listed)
+# mode = "dry-run" : watched and planned, but never changed
+# mode = "live"    : managed for real (also needs dry_run = false above and
+#                    /etc/pve-watchdog/allow-live on the host)
+#
+# The SAME ID is used on every node. Only one node ever has the container
+# registered; the other node(s) hold its latest verified backup file.
+
+# --- Throwaway test containers (used for the test plan) ---
+[[ct]]
+id = 9001
+name = "hatest-a"
+type = "lxc"
+preferred_node = "pve1"
+liveness_ip = "192.168.100.231"
+interval_min = 30
+priority = 1
+mode = "dry-run"
+
+[[ct]]
+id = 9002
+name = "hatest-b"
+type = "lxc"
+preferred_node = "pve2"
+liveness_ip = "192.168.100.232"
+interval_min = 30
+priority = 2
+mode = "dry-run"
+
+# --- Real containers: enabled one at a time, only after Rob approves ---
+# [[ct]]
+# id = 102
+# name = "pihole"
+# type = "lxc"
+# preferred_node = "pve1"
+# liveness_ip = "192.168.100.254"
+# interval_min = 30
+# priority = 1
+# mode = "off"
+#
+# [[ct]]
+# id = 101
+# name = "cloudflared"
+# type = "lxc"
+# preferred_node = "pve1"
+# liveness_ip = "192.168.100.252"
+# interval_min = 30
+# priority = 2
+# mode = "off"
+#
+# [[ct]]
+# id = 103
+# name = "rustdesk"
+# type = "lxc"
+# preferred_node = "pve1"
+# liveness_ip = "192.168.100.241"
+# interval_min = 30
+# priority = 3
+# mode = "off"
