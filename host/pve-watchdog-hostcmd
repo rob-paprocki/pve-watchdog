@@ -477,9 +477,7 @@ def referenced_volumes(vmid):
         return set()
     names = set()
     with open(path) as f:
-        for line in f:
-            if line.startswith("["):        # snapshot sections follow; stop
-                break
+        for line in f:                # every section: snapshots reference volumes too
             names.update(re.findall(r"vm-%d-disk-\d+" % vmid, line))
     return names
 
@@ -839,9 +837,11 @@ def v_start(cfg, vmid):
 @with_lock
 def v_stop(cfg, vmid):
     vmid = parse_vmid(vmid)
-    ct, _role, _base = member(cfg, vmid)
+    ct, role, _base = member(cfg, vmid)
     x = Ctx(cfg, "stop", ct)
     x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    if role == "standby":
+        x.require(STANDBY_TAG in conf_tags(vmid), "CT %d carries the %s tag" % (vmid, STANDBY_TAG))
     if x.live and ct_status_local(vmid) == "stopped":
         return x.result(note="already stopped")
     if x.live:
@@ -1010,6 +1010,10 @@ def v_refresh(cfg, vmid):
     locs = conf_locations(vmid)
     creating = locs == [] and role == "standby"
     x.require(creating or locs == [me()], "CT %d is registered here (or is a new standby)" % vmid)
+    if role == "standby" and not creating:
+        x.require(STANDBY_TAG in conf_tags(vmid),
+                  "CT %d carries the %s tag (it is our standby, not another container)"
+                  % (vmid, STANDBY_TAG))
     if not creating and locs == [me()]:
         x.require(ct_status_local(vmid) == "stopped", "CT %d is stopped" % vmid)
     x.require(role_active(base) != role, "the OTHER copy is the active one, so this copy "
@@ -1080,6 +1084,8 @@ def v_activate(cfg, base, which):
     other_id, other_home = members_[other]
     x.require(home == me(), "CT %d (%s) belongs on this node" % (vmid, which))
     x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
+    if which == "standby":
+        x.require(STANDBY_TAG in conf_tags(vmid), "CT %d carries the %s tag" % (vmid, STANDBY_TAG))
     status = ct_status_local(vmid)
     if x.live and status == "running" and role_active(base) == which:
         return x.result(note="already active and running")
@@ -1169,7 +1175,16 @@ def v_put_config(cfg, who):
     validate_cfg(new)
     # Each covered guest must exist as a container (or already be covered:
     # during a takeover a file-mode CT can briefly be registered nowhere).
-    kinds = {int(r["vmid"]): r.get("type") for r in cluster_guests()}
+    guests = cluster_guests()
+    kinds = {int(r["vmid"]): r.get("type") for r in guests}
+    tags = {int(r["vmid"]): re.split(r"[;,\s]+", r.get("tags") or "") for r in guests}
+    for c in new.get("ct", []):
+        if c.get("mode", "off") != "off" and c.get("standby") == "container":
+            sb = c["id"] + int(new.get("cluster", {}).get("standby_offset", 1000))
+            if sb in kinds and STANDBY_TAG not in tags.get(sb, []):
+                raise Refused("CT %d's standby ID %d already belongs to another guest (it has "
+                              "no %s tag); choose a different standby_offset or free that ID"
+                              % (c["id"], sb, STANDBY_TAG))
     before = {c["id"] for c in cfg.get("ct", [])}
     for c in new.get("ct", []):
         if c.get("mode", "off") == "off" or c["id"] in before:

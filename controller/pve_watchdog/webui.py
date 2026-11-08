@@ -105,15 +105,18 @@ class Throttle:
         self.lock = threading.Lock()
         self.fails = {}
 
-    def allowed(self, ip):
+    def reserve(self, ip):
+        """Count this attempt as a failure UP FRONT (under the lock), so many
+        parallel attempts can't all slip past the limit while they're being
+        checked. A successful login clears the count."""
         with self.lock:
             t = time.time()
-            self.fails[ip] = [x for x in self.fails.get(ip, []) if t - x < self.window]
-            return len(self.fails[ip]) < self.limit
-
-    def failed(self, ip):
-        with self.lock:
-            self.fails.setdefault(ip, []).append(time.time())
+            recent = [x for x in self.fails.get(ip, []) if t - x < self.window]
+            if len(recent) >= self.limit:
+                self.fails[ip] = recent
+                return False
+            self.fails[ip] = recent + [t]
+            return True
 
     def ok(self, ip):
         with self.lock:
@@ -299,7 +302,7 @@ class WebApp:
 
     # ---- login ----
     def login(self, body, client_ip):
-        if not self.throttle.allowed(client_ip):
+        if not self.throttle.reserve(client_ip):
             raise ApiError(429, "too many failed logins; wait 10 minutes")
         user, password = body.get("username"), body.get("password")
         if not isinstance(user, str) or not isinstance(password, str) or not user or not password:
@@ -311,7 +314,6 @@ class WebApp:
         if not r.get("ok"):
             # Same answer for every failure (wrong password, two-factor
             # account, ...), so the page can't be used to test passwords.
-            self.throttle.failed(client_ip)
             raise ApiError(401, "wrong username or password")
         if not r.get("admin"):
             raise ApiError(403, "%s is not a Proxmox administrator" % r.get("user"))

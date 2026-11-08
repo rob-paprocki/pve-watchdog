@@ -1,10 +1,17 @@
 name: Release
 
-# Runs in the PUBLIC repository when a version tag arrives: builds the download
-# files (tarball, get.sh, SHA256SUMS) and the GitHub release.
+# Runs in the PUBLIC repository when a version tag arrives (or by hand for a
+# tag): builds the download files (tarball, get.sh, SHA256SUMS) and the
+# GitHub release.
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build the release for, e.g. v1.0.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,11 +20,15 @@ jobs:
   release:
     if: github.repository == 'rob-paprocki/pve-watchdog'
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Tag must be exactly vX.Y.Z
         run: |
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag name"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag name"; exit 1; }
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -25,18 +36,20 @@ jobs:
         run: PYTHONPATH=controller python3 -m unittest discover -s tests
       - name: Build download files
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG#v}"
           git archive --format=tar.gz --prefix="pve-watchdog-$VERSION/" \
-              -o "pve-watchdog-$VERSION.tar.gz" "$GITHUB_REF_NAME"
-          sed "s/@VERSION@/$VERSION/" get.sh > get.sh.release && mv get.sh.release get.sh.out
-          mkdir dist && mv "pve-watchdog-$VERSION.tar.gz" dist/ && mv get.sh.out dist/get.sh
+              -o "pve-watchdog-$VERSION.tar.gz" "$TAG"
+          mkdir dist && mv "pve-watchdog-$VERSION.tar.gz" dist/
+          sed "s/@VERSION@/$VERSION/" get.sh > dist/get.sh
           (cd dist && sha256sum "pve-watchdog-$VERSION.tar.gz" get.sh > SHA256SUMS && cat SHA256SUMS)
           python3 scripts/release/changelog.py notes "$VERSION" > notes.md
           printf '\n---\nInstall on each Proxmox node, as root:\n\n```bash\nbash -c "$(curl -fsSL https://github.com/%s/releases/download/%s/get.sh)"\n```\n' \
-              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> notes.md
-      - name: Create GitHub release
+              "$GITHUB_REPOSITORY" "$TAG" >> notes.md
+      - name: Create GitHub release (skip if it already exists)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" dist/* --title "pve-watchdog $VERSION" --notes-file notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; nothing to do"; exit 0
+          fi
+          gh release create "$TAG" dist/* --title "pve-watchdog ${TAG#v}" --notes-file notes.md --verify-tag

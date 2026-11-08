@@ -338,6 +338,7 @@ class PairTests(Sandbox):
 
     def test_refresh_existing_standby_uses_force(self):
         self.conf("pve2", 10001)
+        hc.conf_tags = lambda vmid: ["test", "pve-watchdog-standby"]
         hc.v_refresh(hc.load_cfg(), "10001")
         self.assertEqual(self.pct()[0][-2:], ["--force", "1"])
 
@@ -394,6 +395,7 @@ class PairTests(Sandbox):
 
     def test_activate_standby_when_peer_dead(self):
         self.conf("pve2", 10001)
+        hc.conf_tags = lambda vmid: ["test", "pve-watchdog-standby"]
         r = hc.v_activate(hc.load_cfg(), "9001", "standby")
         self.assertTrue(r["live"])
         self.assertEqual(hc.role_active(9001), "standby")
@@ -420,6 +422,16 @@ class PairTests(Sandbox):
         with self.assertRaises(hc.Refused):
             hc.v_activate(hc.load_cfg(), "9001", "standby")
         self.assertEqual(hc.role_active(9001), "original")
+
+    def test_untagged_standby_id_is_never_touched(self):
+        """An unrelated container sitting on the standby ID must not be overwritten,
+        started or stopped."""
+        self.conf("pve2", 10001)                     # conf_tags -> ["test"]: not ours
+        for fn, args in ((hc.v_refresh, ("10001",)), (hc.v_activate, ("9001", "standby")),
+                         (hc.v_stop, ("10001",))):
+            with self.assertRaises(hc.Refused):
+                fn(hc.load_cfg(), *args)
+        self.assertEqual(self.pct(), [])
 
     def test_push_only_from_active_copy(self):
         self.conf("pve2", 10001)                  # passive standby here
@@ -480,6 +492,18 @@ class WebUiVerbTests(Sandbox):
                 hc.validate_cfg(tomllib.loads(bad))
         hc.validate_cfg(tomllib.loads(EXAMPLE))                       # the example is fine
 
+    def test_standby_id_taken_by_another_guest_refused(self):
+        self.guests.append({"vmid": 10102, "type": "lxc", "node": "pve2", "tags": "mine"})
+        self.guests.append({"vmid": 102, "type": "lxc", "node": "pve1"})
+        text = EXAMPLE + ('\n[[ct]]\nid = 102\npreferred_node = "pve1"\nstandby = "container"\n'
+                          'mode = "live"\n')
+        text = text.replace("[cluster]\n", "[cluster]\nstandby_offset = 10000\n", 1)
+        with self.assertRaises(hc.Refused) as e:
+            self.put(text)
+        self.assertIn("already belongs to another guest", str(e.exception))
+        self.guests[-2]["tags"] = "mine;pve-watchdog-standby"     # it IS our standby: fine
+        self.put(text)
+
     def test_vm_cannot_be_covered(self):
         text = EXAMPLE + '\n[[ct]]\nid = 200\npreferred_node = "pve2"\nmode = "dry-run"\n'
         with self.assertRaises(hc.Refused) as e:
@@ -523,6 +547,14 @@ class WebUiVerbTests(Sandbox):
         hc.STDIN = '{"username": "root"}'
         with self.assertRaises(hc.Refused):
             hc.v_check_login(hc.load_cfg())
+
+
+class VolumeTests(Sandbox):
+    def test_snapshot_referenced_volume_is_not_an_orphan(self):
+        p = self.conf("pve2", 9002)
+        with open(p, "a") as f:
+            f.write("\n[before-upgrade]\nrootfs: local-lvm:vm-9002-disk-1,size=2G\n")
+        self.assertEqual(hc.referenced_volumes(9002), {"vm-9002-disk-0", "vm-9002-disk-1"})
 
 
 class MainTests(Sandbox):

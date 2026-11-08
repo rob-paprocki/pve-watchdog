@@ -689,6 +689,11 @@ class SigningTests(unittest.TestCase):
         c = PeerClient(b"k", self.port, "pve2")
         self.assertIsNone(c.status({"name": "pve2", "controller_ip": "127.0.0.1"}))
 
+    def test_reload_is_an_allowed_action(self):
+        c = PeerClient(b"k", self.port, "pve2")
+        self.assertEqual(c.action(self.node, "reload", 0)["result"], "ok")
+        self.assertEqual(self.actions[-1], ("pve2", "reload", 0))
+
     def test_disallowed_verb(self):
         c = PeerClient(b"k", self.port, "pve2")
         self.assertFalse(c.action(self.node, "rm_rf", 9001)["ok"])

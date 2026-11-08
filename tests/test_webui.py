@@ -201,6 +201,19 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.login(pw="nope")[0], 401)
         self.assertEqual(self.login()[0], 429)                         # even the right one now waits
 
+    def test_parallel_logins_cannot_beat_the_limit(self):
+        import threading
+        from pve_watchdog.webui import Throttle
+        t = Throttle(limit=5)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(t.reserve("192.168.100.9")))
+                   for _ in range(50)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(results.count(True), 5)
+
     def test_non_admin_refused(self):
         self.assertEqual(self.login("viewer@pve", "pw")[0], 403)
 

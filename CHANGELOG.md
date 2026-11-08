@@ -7,6 +7,23 @@ to do anything when upgrading.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-08
+**Upgrading:** re-run the installer on each node (or `get.sh`); nothing else to do.
+
+### Security
+- A protected container's standby ID that is already used by an unrelated
+  container is refused, and the watchdog only ever overwrites, starts or stops
+  a standby that carries the `pve-watchdog-standby` tag.
+- Leftover-disk cleanup now counts disks referenced only by snapshots as in use.
+- The web UI's limit of 5 failed logins can no longer be raced with parallel attempts.
+
+### Fixed
+- A setting saved in the web UI now takes effect on every node within seconds
+  (the other watchdogs are told to re-read the shared config right away,
+  instead of within a minute).
+- The release workflow can also be started by hand for a tag, and skips a
+  release that already exists.
+
 ## [1.0.0] - 2026-11-08
 **Upgrading:** nothing to do. This is the first release; install with the
 one-command installer described in the README.

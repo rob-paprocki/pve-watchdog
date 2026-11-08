@@ -107,6 +107,9 @@ def cmd_daemon():
     def action_fn(from_node, verb, vmid):
         if from_node not in cfg.nodes or from_node == cfg.me:
             raise ValueError("unknown requesting node")
+        if verb == "reload":                       # another node saved the shared config
+            reload_now.set()
+            return {"reload": True}
         c = cfg.ct(vmid)
         if not c:
             raise ValueError("CT %s is not covered" % vmid)
@@ -157,6 +160,8 @@ def cmd_daemon():
                 cfg = fresh
                 notifier.webhook = fresh.discord_webhook     # pick up a new webhook URL
                 last_reload = time.time()
+                if reload_now.is_set():
+                    log.info("config re-read on request (saved in the web UI)")
                 reload_now.clear()
             except Exception as e:
                 log.warning("config reload failed, keeping the old one: %s", e)
@@ -177,7 +182,18 @@ def start_web_ui(engine, host, notifier, reload_now):
             return engine.cfg
 
         def reload(self):
+            # The config lives in /etc/pve, so every node already has the new
+            # file; tell the other watchdogs to re-read it now, not within a minute.
             reload_now.set()
+            cfg = engine.cfg
+
+            def tell_peers():
+                for p in cfg.peers():
+                    try:
+                        engine.peers.action(p, "reload", 0, timeout=5)
+                    except Exception as e:
+                        log.info("could not ask %s to reload: %s", p["name"], e)
+            threading.Thread(target=tell_peers, daemon=True).start()
 
         def sync_alerts(self):
             return State(VAR + "/sync-state.json").data.get("alerts", {})

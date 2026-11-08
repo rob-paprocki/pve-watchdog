@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 log = logging.getLogger("pve-watchdog.peer")
 MAX_SKEW = 60          # seconds; clocks on the nodes must be roughly in sync (NTP)
 MAX_BODY = 65536
-ALLOWED_ACTIONS = ("restore_start", "free_orphans", "refresh", "refresh_activate")
+ALLOWED_ACTIONS = ("restore_start", "free_orphans", "refresh", "refresh_activate", "reload")
 
 
 def _msg(*parts):
