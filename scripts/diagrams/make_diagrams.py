@@ -4,7 +4,7 @@
   python3 scripts/diagrams/make_diagrams.py        # writes docs/images/diagram-*.svg
 
 GitHub's mobile app doesn't draw Mermaid, but it shows images, so the diagrams
-are images. They are text (SVG), so the public-copy word-list scan reads them
+are images. They are text (SVG), so they diff and scan
 like any other file. The README picks the version with <picture>, following the
 visitor's light/dark setting, like the screenshots.
 """

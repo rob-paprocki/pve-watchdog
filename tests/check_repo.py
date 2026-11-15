@@ -5,6 +5,7 @@ Checks every git-tracked file (or every file under a directory), except
 anything in private/:
 
   * email addresses: only placeholders (example.com and its subdomains,
+    the maintainer's public domain rpaprocki.com and its subdomains,
     .invalid) and a few service addresses are allowed;
   * IPv4/IPv6 addresses: only the example network 192.168.100.0/24, loopback,
     0.0.0.0 / 255.255.255.255, the documentation ranges and a few well-known
@@ -43,6 +44,7 @@ def email_ok(addr):
     a = addr.lower()
     domain = a.split("@", 1)[1]
     return (a in ALLOWED_EMAILS or domain == "example.com" or domain.endswith(".example.com")
+            or domain == "rpaprocki.com" or domain.endswith(".rpaprocki.com")   # the maintainer's public domain
             or domain.endswith(".invalid") or domain in ("example.org", "example.net"))
 
 
@@ -85,7 +87,7 @@ def files_in(root):
     found = []
     for d, _dirs, names in os.walk(root):
         for name in names:
-            found.append(os.path.relpath(os.path.join(d, name), root))
+            found.append(os.path.relpath(os.path.join(d, name), root).replace(os.sep, "/"))
     return found
 
 

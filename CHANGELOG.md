@@ -7,6 +7,14 @@ to do anything when upgrading.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-15
+**Upgrading:** nothing to do.
+
+### Changed
+
+- The web UI shows a plain hyphen in empty table cells, and the webhook field's placeholder reads *(set; type a new one to replace)*.
+- The README's license badge now reads the license from GitHub, and a last-commit badge sits beside it.
+
 ## [1.1.1] - 2026-11-08
 **Upgrading:** re-run `get.sh` on each node; nothing else to do.
 
@@ -81,3 +89,9 @@ one-command installer described in the README.
 - One-command installer with a setup wizard.
 - Proxmox Notes on each node and watchdog container with a clickable link to
   the web UI.
+
+[Unreleased]: https://github.com/rob-paprocki/pve-watchdog/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/rob-paprocki/pve-watchdog/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/rob-paprocki/pve-watchdog/compare/v1.0.1...v1.1.0
+[1.0.1]: https://github.com/rob-paprocki/pve-watchdog/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/rob-paprocki/pve-watchdog/releases/tag/v1.0.0

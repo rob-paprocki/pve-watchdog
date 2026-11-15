@@ -315,9 +315,9 @@ class PublishTests(unittest.TestCase):
 
     def test_first_release_on_acknowledged_base(self):
         with open(os.path.join(self.public, "x.txt"), "w") as f:
-            f.write("owner edit\n")
+            f.write("maintainer edit\n")
         git(self.public, "add", "-A")
-        git(self.public, "commit", "-q", "-m", "owner edit")
+        git(self.public, "commit", "-q", "-m", "maintainer edit")
         head = git(self.public, "rev-parse", "HEAD")
         with self.assertRaises(publish.PublishError):                     # wrong base
             publish.prepare(self.public, self.copy, "1.0.0", first_base="0000000")
@@ -381,7 +381,7 @@ class PublishTests(unittest.TestCase):
         self._write("README.md", "docs\n")
         publish.prepare_docs(self.public, self.copy)
         with open(os.path.join(self.public, "README.md"), "w") as f:
-            f.write("owner edit\n")
+            f.write("maintainer edit\n")
         git(self.public, "commit", "-qam", "pve-watchdog docs: update")      # right subject, not the bot
         with self.assertRaises(publish.PublishError):
             publish.prepare(self.public, self.copy, "1.0.1")

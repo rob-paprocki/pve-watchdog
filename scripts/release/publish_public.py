@@ -4,7 +4,7 @@
   publish_public.py PUBLIC_CLONE COPY_DIR VERSION [--push] [--first-base SHA]
   publish_public.py PUBLIC_CLONE COPY_DIR --docs [--push]
 
---first-base: only for the FIRST release, when the owner has already made
+--first-base: only for the FIRST release, when the maintainer has already made
 commits in the public repo by hand: publish on top of exactly that commit.
 
 Without --push it only prepares the commit and tag locally (a rehearsal).
@@ -16,7 +16,7 @@ Checks before anything is committed:
   * if vVERSION already exists there with the same content, there is nothing
     to do (a re-run after a half-done publish finishes cleanly).
 
-The commit is "pve-watchdog VERSION" by a bot identity (never the owner's
+The commit is "pve-watchdog VERSION" by a bot identity (never the maintainer's
 email) on top of the previous version; the whole tree is replaced, so files
 deleted since the last release are deleted publicly too. Branch and tag are
 pushed together (--atomic).
@@ -82,10 +82,10 @@ def check_unmoved(repo, version, first_base=None):
         return "already-tagged"
     if not tags:
         if first_base:
-            # First release on top of commits the owner made by hand: allowed only
-            # if the public repo is EXACTLY at the commit he acknowledged.
+            # First release on top of commits the maintainer made by hand: allowed only
+            # if the public repo is EXACTLY at the commit the maintainer acknowledged.
             if not head.startswith(first_base.lower()) or len(first_base) < 7:
-                raise PublishError("the public repo is not at the acknowledged commit %s"
+                raise PublishError("the public repo is not at tthe maintainer acknowledged commit %s"
                                    % first_base[:12])
             return "first"
         if git(repo, "rev-list", "--count", "HEAD") != "1":

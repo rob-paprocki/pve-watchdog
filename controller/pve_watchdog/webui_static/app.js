@@ -191,7 +191,7 @@ async function dashboard() {
       h("td", {}, h("b", {}, c.id), " ", c.name || ""),
       h("td", {}, pill(c.mode, c.mode === "live" ? "ok" : c.mode === "dry-run" ? "warn" : "")),
       h("td", {}, pill(s.label, s.kind), h("div", { class: "small muted" }, s.running)),
-      h("td", { class: "small" }, s.copy ? ago(s.copy) : "—"),
+      h("td", { class: "small" }, s.copy ? ago(s.copy) : "-"),
       h("td", {},
         h("button", { onclick: () => act("Sync " + c.id, () => api("POST", "/api/action", { action: "sync", id: c.id })) }, "Sync now"),
         " ",
@@ -287,7 +287,7 @@ async function guests() {
       h("td", {}, h("b", {}, g.id), " ", g.name),
       h("td", {}, g.type === "lxc" ? "container" : "VM"),
       h("td", {}, g.node, " ", pill(g.status, g.status === "running" ? "ok" : "")),
-      h("td", { class: "small" }, g.ip || "—"),
+      h("td", { class: "small" }, g.ip || "-"),
       h("td", {}, c ? pill(c.mode + " · " + (c.standby || "file"), c.mode === "live" ? "ok" : "warn")
                     : (g.type === "lxc" && !g.role ? pill("not protected") : "")),
       cell);
@@ -317,7 +317,7 @@ async function nodes() {
   const o = await api("GET", "/api/overview");
   const rows = o.nodes.map((n) => h("tr", {},
     h("td", {}, h("b", {}, n.name), n.me ? " (this one)" : ""),
-    h("td", {}, n.host_ip), h("td", {}, n.controller_id, " · ", n.controller_ip), h("td", {}, n.wol_mac || "—"),
+    h("td", {}, n.host_ip), h("td", {}, n.controller_id, " · ", n.controller_ip), h("td", {}, n.wol_mac || "-"),
     h("td", {}, n.me ? "" : h("div", { class: "row" },
       n.wol_mac ? h("button", { onclick: () => act("Wake " + n.name, () => api("POST", "/api/action", { action: "wake", node: n.name })) }, "Wake") : null,
       h("button", { class: "danger", onclick: () => {
@@ -395,7 +395,7 @@ async function settings() {
     if (body[".dry_run"] === false && !confirm("Switch dry-run OFF? The watchdog will then really act.")) return;
     act("Save settings", async () => { await api("POST", "/api/settings", body); await settings(); });
   } }, "Save settings");
-  const hook = h("input", { type: "password", placeholder: conf.webhook_set ? "(set — type a new one to replace)" : "https://discord.com/api/webhooks/…" });
+  const hook = h("input", { type: "password", placeholder: conf.webhook_set ? "(set; type a new one to replace)" : "https://discord.com/api/webhooks/…" });
   setView(...cards,
     h("div", { class: "card" }, h("h3", {}, "Discord alerts"),
       h("p", { class: "small muted" }, "The webhook URL is stored in the root-only secret file and is never shown again."),

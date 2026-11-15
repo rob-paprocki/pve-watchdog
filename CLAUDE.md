@@ -1,7 +1,5 @@
 # Notes for Claude
 
-If `private/RELEASING.md` exists, follow it when asked to cut a release.
-
 - Tests: `PYTHONPATH=controller python3 -m unittest discover -s tests`
 - Public files must pass `python3 tests/check_repo.py` (example network
   `192.168.100.0/24`, MACs `00:00:5E:00:53:xx`, placeholder emails only).

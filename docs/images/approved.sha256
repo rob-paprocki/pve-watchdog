@@ -1,4 +1,4 @@
-# SHA-256 of every image allowed in the public repo. Each one was looked at
+# SHA-256 of every image allowed in this repo. Each one was looked at
 # by a person and shows only example data. tests/check_repo.py refuses any
 # image that isn't listed here (or that carries PNG metadata).
 # Regenerate screenshots with scripts/screenshots/demo_webui.py.

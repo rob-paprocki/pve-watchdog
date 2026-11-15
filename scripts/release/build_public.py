@@ -91,7 +91,7 @@ def remove_private(out):
 def all_files(out):
     for d, _dirs, names in os.walk(out):
         for n in names:
-            yield os.path.relpath(os.path.join(d, n), out)
+            yield os.path.relpath(os.path.join(d, n), out).replace(os.sep, "/")
 
 
 def wordlist_check(out, patterns, messages):
@@ -166,7 +166,7 @@ def build(ref, out, patterns, messages=(), repo="."):
 
 
 def explain(root, wordlist_path):
-    """Local diagnosis for the owner: which word-list LINE NUMBER matches which
+    """Local diagnosis for the maintainer: which word-list LINE NUMBER matches which
     file:line. Never prints the pattern or the matched text."""
     with open(wordlist_path, encoding="utf-8") as f:
         lines = [(n, l.strip()) for n, l in enumerate(f, 1) if l.strip() and not l.strip().startswith("#")]

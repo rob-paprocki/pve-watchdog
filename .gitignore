@@ -2,4 +2,4 @@ __pycache__/
 *.pyc
 .playwright-mcp/
 .claude/
-private/wordlist.local
+wordlist.local

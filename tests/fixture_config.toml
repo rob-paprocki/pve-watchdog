@@ -96,7 +96,7 @@ interval_min = 30
 priority = 2
 mode = "dry-run"
 
-# --- Real containers: enabled one at a time, only after Rob approves ---
+# --- Real containers: enabled one at a time, only after the owner approves ---
 # [[ct]]
 # id = 102
 # name = "pihole"

@@ -2,7 +2,8 @@
 
 [![Release](https://img.shields.io/github/v/release/rob-paprocki/pve-watchdog)](https://github.com/rob-paprocki/pve-watchdog/releases/latest)
 [![CI](https://github.com/rob-paprocki/pve-watchdog/actions/workflows/ci.yml/badge.svg)](https://github.com/rob-paprocki/pve-watchdog/actions/workflows/ci.yml)
-[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/github/license/rob-paprocki/pve-watchdog)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/rob-paprocki/pve-watchdog)](https://github.com/rob-paprocki/pve-watchdog/commits/main)
 [![Proxmox VE 8 | 9](https://img.shields.io/badge/Proxmox%20VE-8%20%7C%209-e57000)](https://www.proxmox.com/en/proxmox-virtual-environment)
 
 Failover for the LXC containers you can't do without, on a small Proxmox VE

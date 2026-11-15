@@ -397,7 +397,7 @@ class BootTests(unittest.TestCase):
 
     def test_controller_restart_is_not_a_boot(self):
         eng, host, probes, peers, clock = make()
-        host.st["cts"]["9002"]["status"] = "stopped"     # e.g. Rob stopped it on purpose
+        host.st["cts"]["9002"]["status"] = "stopped"     # e.g. the maintainer stopped it on purpose
         eng.boot_arbitration()
         self.assertEqual(host.calls, [])
 
