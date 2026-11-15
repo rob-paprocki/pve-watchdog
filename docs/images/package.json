@@ -1,0 +1,11 @@
+{
+  "name": "readme-diagrams",
+  "private": true,
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "12.2.0",
+    "puppeteer": "25.13.0"
+  },
+  "overrides": {
+    "mermaid": "12.3.0"
+  }
+}

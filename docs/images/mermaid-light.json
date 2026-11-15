@@ -1,0 +1,34 @@
+{
+  "theme": "base",
+  "look": "classic",
+  "htmlLabels": false,
+  "markdownAutoWrap": false,
+  "flowchart": {
+    "htmlLabels": false,
+    "padding": 8,
+    "nodeSpacing": 20,
+    "rankSpacing": 40,
+    "wrappingWidth": 600
+  },
+  "themeVariables": {
+    "fontFamily": "Arial, Helvetica, \"Liberation Sans\", sans-serif",
+    "fontSize": "16px",
+    "background": "#ffffff",
+    "primaryColor": "#ddf4ff",
+    "primaryTextColor": "#1f2328",
+    "primaryBorderColor": "#0969da",
+    "secondaryColor": "#fff8c5",
+    "tertiaryColor": "#f6f8fa",
+    "lineColor": "#6e7781",
+    "textColor": "#1f2328",
+    "clusterBkg": "#f6f8fa",
+    "clusterBorder": "#8c959f",
+    "titleColor": "#1f2328",
+    "edgeLabelBackground": "#ffffff",
+    "nodeTextColor": "#1f2328",
+    "noteBkgColor": "#fff8c5",
+    "noteBorderColor": "#d4a72c",
+    "noteTextColor": "#1f2328"
+  },
+  "themeCSS": ".edgeLabel rect{opacity:1 !important;} .labelBkg{background-color:transparent;}"
+}

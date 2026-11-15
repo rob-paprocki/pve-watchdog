@@ -7,6 +7,13 @@ to do anything when upgrading.
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-11-15
+**Upgrading:** nothing to do.
+
+### Changed
+
+- The diagrams in the README and in `docs/how-it-works.md` are drawn from Mermaid now, with the source in a collapsed section under each picture.
+
 ## [1.1.2] - 2026-11-15
 **Upgrading:** nothing to do.
 

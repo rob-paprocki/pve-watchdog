@@ -1,0 +1,14 @@
+sequenceDiagram
+  participant pve1
+  participant pve2
+  Note over pve1: Power cut
+  pve2-)pve1: ping, web port, cluster, watchdog
+  Note over pve2: No answer for 6 rounds
+  pve2--)pve1: Wake-on-LAN
+  Note over pve2: Wait 90 s, then ping and ARP<br/>CT 110's own IP
+  Note over pve2: Nothing answers: start CT 1110<br/>(about 3 min in)
+  Note over pve1: Power back,<br/>healthy for 10 min
+  Note over pve2: Stop CT 1110,<br/>take a final backup
+  pve2->>pve1: copy the backup into CT 110
+  Note over pve1: Start CT 110
+  Note over pve2: CT 1110 is the standby again

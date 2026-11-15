@@ -60,16 +60,57 @@ every safety rule before it acts.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/diagram-architecture-dark.svg">
-  <img alt="What runs where: on each node a watchdog container talks over SSH to a gatekeeper script; CT 110 runs on pve1 and is copied every 30 minutes to its stopped standby CT 1110 on pve2" src="docs/images/diagram-architecture-light.svg" width="100%">
+  <img alt="What runs where: on each node a watchdog container talks over SSH to a gatekeeper script; CT 110 runs on pve1 and is copied every 30 minutes to its stopped standby CT 1110 on pve2" src="docs/images/diagram-architecture-light.svg">
 </picture>
+
+<details>
+<summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+flowchart TB
+  subgraph pve1
+    W1["Watchdog<br/>CT 9100"] -->|SSH| G1["Gatekeeper"] --> C1["CT 110 pihole<br/>running"]:::ok
+  end
+  subgraph pve2
+    W2["Watchdog<br/>CT 9101"] -->|SSH| G2["Gatekeeper"] --> C2["CT 1110 pihole<br/>standby, stopped"]:::quiet
+  end
+  W1 <-->|"checks every 10 s"| W2
+  C1 -.->|"copy every 30 min"| C2
+  classDef ok stroke:#1a7f37,stroke-width:2px
+  classDef quiet stroke-dasharray:4 3
+```
+
+</details>
 
 </td>
 <td width="50%" valign="top">
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/diagram-timeline-dark.svg">
-  <img alt="A power cut on pve1: pve2 sees no answer for 6 rounds, sends Wake-on-LAN, waits 90 seconds, checks the container's IP, starts CT 1110, and later stops it and copies its data back into CT 110 when pve1 has been healthy for 10 minutes" src="docs/images/diagram-timeline-light.svg" width="100%">
+  <img alt="A power cut on pve1: pve2 sees no answer for 6 rounds, sends Wake-on-LAN, waits 90 seconds, checks the container's IP, starts CT 1110, and later stops it and copies its data back into CT 110 when pve1 has been healthy for 10 minutes" src="docs/images/diagram-timeline-light.svg">
 </picture>
+
+<details>
+<summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+  participant pve1
+  participant pve2
+  Note over pve1: Power cut
+  pve2-)pve1: ping, web port, cluster, watchdog
+  Note over pve2: No answer for 6 rounds
+  pve2--)pve1: Wake-on-LAN
+  Note over pve2: Wait 90 s, then ping and ARP<br/>CT 110's own IP
+  Note over pve2: Nothing answers: start CT 1110<br/>(about 3 min in)
+  Note over pve1: Power back,<br/>healthy for 10 min
+  Note over pve2: Stop CT 1110,<br/>take a final backup
+  pve2->>pve1: copy the backup into CT 110
+  Note over pve1: Start CT 110
+  Note over pve2: CT 1110 is the standby again
+```
+
+</details>
 
 </td>
 </tr>

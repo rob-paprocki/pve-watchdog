@@ -45,6 +45,31 @@ Proxmox web port, cluster membership and the other watchdog. Then:
   <img alt="The takeover decision: after 6 failed rounds and a 90 second wait it stops if the node came back, if this node can't reach the gateway, or if the container's IP answers; without quorum it forces it, then starts the standby" src="images/diagram-decisions-light.svg">
 </picture>
 
+<details>
+<summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+flowchart TD
+  A["All four checks fail<br/>for another node"] --> B{"6 rounds in a row?"}
+  B -->|no| A
+  B -->|yes| C["Wait 90 s<br/>(Wake-on-LAN goes out meanwhile)"]
+  C --> D{"Node back?"}
+  D -->|yes| D1["Nothing to do"]:::quiet
+  D -->|no| E{"Gateway reachable?"}
+  E -->|no| E1["This node is the one cut off:<br/>do nothing"]:::quiet
+  E -->|yes| F{"Container's own IP answers<br/>ping or ARP?"}
+  F -->|yes| F1["Abort and alert"]:::bad
+  F -->|no| G{"Quorum on its own?"}
+  G -->|no| G1["pvecm expected 1<br/>(force mode, loud alert)"]:::bad
+  G -->|yes| H["Check the IP once more,<br/>start the standby"]:::ok
+  G1 --> H
+  classDef ok stroke:#1a7f37,stroke-width:2px
+  classDef bad stroke:#cf222e,stroke-width:2px
+  classDef quiet stroke-dasharray:4 3
+```
+
+</details>
+
 Step by step:
 
 1. A node counts as down only after 6 rounds in a row where all four
