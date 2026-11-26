@@ -146,7 +146,13 @@ Limits enforced in the gatekeeper's code:
   copy, and never force-quorums while the other node still answers.
 * It refuses restores that would fill the thin pool past 80%.
 * It lifts Proxmox's `protection` flag only on its own tagged standby, or on an
-  original while that original is being failed back to.
+  original while that original is being failed back to. On Proxmox VE 9.3 and
+  later it overrides the uid check (`--allow-identity-mismatch`) on exactly the
+  same copies, and only after checking that the backup's uid is the other copy's
+  (a backup from before 9.3 has none and isn't checked).
+* It doesn't start a backup or a refresh while apt or dpkg is installing packages
+  on the host, because Proxmox's own tools can be half replaced at that point.
+  The next pass tries again. A restore during a failover doesn't wait.
 * Configs (including ones saved from the web UI) must pass a strict schema:
   known keys only, with types, ranges and paths checked.
 * It never touches corosync.conf, votes, storage.cfg, partitions, the LVM
@@ -167,6 +173,7 @@ Logs: `/var/log/pve-watchdog-hostcmd.log` on each host, and
 | Router/gateway dies, nodes fine | The nodes still see each other: nothing happens. |
 | Copy interrupted part-way | The previous good copy stays; the next run succeeds. |
 | Thin pool too full | The copy isn't sent and restores are refused (both alerted). |
+| Packages being upgraded on a node | Copies and failbacks wait until apt or dpkg is done. A copy that goes stale meanwhile still raises the stale-copy alert. A failover doesn't wait. |
 | Node returns during the waiting period | The takeover is cancelled. |
 | Both copies seen running | Loud alert; the tool touches neither. Stop one by hand. |
 | Connection drops during a failback | The tool watches for up to 15 minutes to see which copy became active, and only restarts the standby if none did. |

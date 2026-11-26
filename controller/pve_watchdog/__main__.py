@@ -346,7 +346,10 @@ def cmd_failback(args):
     elif not e.get("local"):
         raise SystemExit("CT %d is not registered on this node; run this on the node that has it" % c["id"])
     with BrainLock():
-        ok = engine.failback(c)
+        try:
+            ok = engine.failback(c)
+        except HostError as e:              # e.g. packages are being upgraded on a node
+            raise SystemExit("failback not started: %s" % e)
     state.save()
     notifier.flush()
     print("failback %s" % ("done" if ok else "FAILED (see alerts)"))

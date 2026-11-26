@@ -68,6 +68,10 @@ class Refused(Exception):
     """A safety rule said no."""
 
 
+class Deferred(Exception):
+    """Not now (packages are being upgraded): nothing was changed, try again later."""
+
+
 # ---- Small helpers ----------------------------------------------------------
 
 def now():
@@ -319,9 +323,10 @@ def conf_protected(vmid):
     return False
 
 
-def conf_tags(vmid):
+def conf_tags(vmid, node_name=None):
+    """Tags of a container's config on this node (or on node_name: /etc/pve is cluster-wide)."""
     try:
-        with open(conf_path(me(), vmid)) as f:
+        with open(conf_path(node_name or me(), vmid)) as f:
             for line in f:
                 if line.startswith("["):
                     break
@@ -351,6 +356,136 @@ def refreshed_meta(vmid):
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def wanted_tags(cfg, ct, role):
+    """The tags a refreshed copy of a pair should end up with.
+
+    Those of the OTHER copy (its config is readable here, /etc/pve is cluster-wide),
+    plus the standby tag on the standby and without it on the original. The original
+    is refreshed from the standby's backup during a failback, and must not come
+    back looking like a standby."""
+    other = "original" if role == "standby" else "standby"
+    ovmid, onode = pair(cfg, ct)[other]
+    tags = [t for t in conf_tags(ovmid, onode) if t != STANDBY_TAG]
+    return tags + [STANDBY_TAG] if role == "standby" else tags
+
+
+UID_RE = re.compile(r"[a-z2-7]{20}")         # as PVE::GuestIdentity writes them (base32)
+
+
+def meta_uid(lines):
+    """The guest uid (Proxmox VE 9.3+) in a container config's `meta:` line, or None.
+
+    Only the top section counts: a pending `meta` (in the [pve:pending] section,
+    an unfinished restore) is not the guest's uid. Parsed like
+    PVE::GuestIdentity::parse_identity: a uid given twice is invalid."""
+    for line in lines:
+        if line.startswith("["):
+            break
+        if line.startswith("meta:"):
+            found = []
+            for part in line[5:].strip().split(","):
+                key, sep, value = part.partition("=")
+                if sep and key == "uid":
+                    found.append(value)
+            return found[0] if len(found) == 1 and UID_RE.fullmatch(found[0]) else None
+    return None
+
+
+def conf_uid(vmid, node_name=None):
+    """uid of a container's config on this node (or on node_name), or None."""
+    try:
+        with open(conf_path(node_name or me(), vmid)) as f:
+            return meta_uid(f)
+    except OSError:
+        return None
+
+
+def archive_uid(arc):
+    """uid of the guest a backup was made from, or None if it can't be read.
+
+    Read the way Proxmox reads it before a restore: vzdump writes
+    ./etc/vzdump/pct.conf as the archive's first member, so tar stops there
+    instead of reading the whole archive. A backup from before Proxmox VE 9.3
+    has no uid."""
+    try:
+        p = run(["tar", "-xOf", arc, "--occurrence=1", "--", "./etc/vzdump/pct.conf"],
+                check=False, timeout=600)
+    except (OSError, subprocess.SubprocessError, ValueError):   # timeout, not text, ...
+        return None
+    return meta_uid(p.stdout.splitlines()) if p.returncode == 0 else None
+
+
+def parse_help_options(text):
+    """Option names listed by `pct help <command> --verbose`."""
+    return set(re.findall(r"(?m)^\s*--([a-z][a-z0-9-]*)", text))
+
+
+_RESTORE_OPTIONS = None        # read once per call of this script
+
+
+def restore_options():
+    """The options this host's `pct restore` accepts.
+
+    Looked up instead of guessed from a version number: Proxmox VE 9.3 added
+    --allow-identity-mismatch, which older versions reject as unknown."""
+    global _RESTORE_OPTIONS
+    if _RESTORE_OPTIONS is None:
+        p = run(["pct", "help", "restore", "--verbose"], check=False, timeout=60)
+        opts = parse_help_options(p.stdout)
+        if p.returncode != 0 or "storage" not in opts:
+            raise RuntimeError("could not read the options of pct restore (exit %d): %s" % (
+                p.returncode, (p.stderr or p.stdout).strip()[-300:]))
+        _RESTORE_OPTIONS = opts
+    return _RESTORE_OPTIONS
+
+
+# dpkg and apt hold POSIX locks on these files while they install anything.
+DPKG_LOCKS = ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock")
+PROC_LOCKS = "/proc/locks"
+
+
+def lock_holders(path):
+    """PIDs holding a lock on path, read from /proc/locks.
+
+    Only looks: the lock is never taken, not even for a moment, so an apt that
+    starts at that instant cannot fail because of us."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    key = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    pids = []
+    try:
+        with open(PROC_LOCKS) as f:
+            for line in f:
+                # "12: POSIX  ADVISORY  WRITE 4242 fd:00:1835023 0 EOF"; waiters show "->"
+                w = line.split()
+                if len(w) >= 6 and w[1] != "->" and w[5] == key:
+                    pids.append(w[4])
+    except OSError:
+        pass
+    return pids
+
+
+def packages_busy():
+    """None, or why now is a bad time: dpkg or apt is installing packages here.
+
+    While they run, Proxmox's own Perl modules can be half replaced, and a pct
+    command fails part-way (a restore worked, the pct set right after it did not)."""
+    for path in DPKG_LOCKS:
+        pids = lock_holders(path)
+        if pids:
+            return "dpkg/apt is installing or upgrading packages (%s is held by pid %s)" % (
+                path, ",".join(pids))
+    return None
+
+
+def defer_while_packages_busy(what):
+    why = packages_busy()
+    if why:
+        raise Deferred("%s waits: %s on this host; the next pass tries again" % (what, why))
 
 
 def node(cfg, name):
@@ -586,12 +721,14 @@ class Ctx:
                      and os.path.exists(ALLOW_LIVE) and mode_live)
         self.checks, self.would = [], []
 
-    def require(self, ok, what):
+    def require(self, ok, what, hint=None):
+        """hint: how to recover, added to the message only when the check fails."""
         self.checks.append({"check": what, "ok": bool(ok)})
         if not ok:
+            why = what + (". " + hint if hint else "")
             if self.live:
-                raise Refused("%s: safety check failed: %s" % (self.verb, what))
-            log("DRY-RUN %s: check would FAIL: %s" % (self.verb, what))
+                raise Refused("%s: safety check failed: %s" % (self.verb, why))
+            log("DRY-RUN %s: check would FAIL: %s" % (self.verb, why))
 
     def cmd(self, argv, timeout=600):
         if not self.live:
@@ -689,7 +826,7 @@ def v_status(cfg):
             "allow_live": os.path.exists(ALLOW_LIVE), "quorum": q,
             "pool": pool(cfg), "cts": cts,
             "gateway_ok": ping(cl(cfg, "gateway"), cfg.get("probe", {}).get("timeout", 2)),
-            "maintenance": maintenance_state()}
+            "maintenance": maintenance_state(), "packages_busy": packages_busy()}
 
 
 def status_pair(cfg, c):
@@ -750,6 +887,8 @@ def v_backup(cfg, vmid, mode="snapshot"):
     vmid = parse_vmid(vmid)
     ct, role, base = member(cfg, vmid)
     x = Ctx(cfg, "backup", ct)
+    if x.live:
+        defer_while_packages_busy("backup %d" % vmid)
     x.require(mode in ("snapshot", "stop"), "mode is snapshot or stop")
     x.require(conf_locations(vmid) == [me()], "CT %d is registered on this node" % vmid)
     work = cl(cfg, "work_dir", "/var/lib/pve-watchdog/work")
@@ -947,7 +1086,12 @@ def v_release(cfg, vmid):
 
 @with_lock
 def v_restore(cfg, vmid):
-    """Bring a container up on THIS node from its latest verified backup."""
+    """Bring a container up on THIS node from its latest verified backup.
+
+    Not deferred while packages are being upgraded, unlike backup and refresh:
+    it only runs while the container is down and registered nowhere (a takeover,
+    a failback, or the rollback of one), so waiting would only make the outage
+    longer. The controllers hold back failbacks while packages are upgraded."""
     vmid = parse_vmid(vmid)
     ct = covered(cfg, vmid)
     x = Ctx(cfg, "restore", ct)
@@ -1003,6 +1147,44 @@ def v_free_orphans(cfg, vmid):
     return x.result(orphans=orphans)
 
 
+TAG_TRIES = 3
+
+
+def settle_tags(x, vmid, role, tags, in_restore):
+    """After a refresh: check the copy's tags, and set them if they are not right.
+
+    The standby MUST carry the standby tag, so setting it is retried and a final
+    failure fails the refresh. On the original, a leftover standby tag (it came
+    with the standby's backup) is only cosmetic: a failure is logged, and the
+    failback goes on."""
+    argv = ["pct", "set", str(vmid), "--tags", ";".join(tags)] if tags else \
+        ["pct", "set", str(vmid), "--delete", "tags"]
+    if not x.live:
+        if role == "standby" and not in_restore:
+            x.cmd(argv, timeout=60)
+        return
+    have = conf_tags(vmid)
+    if role != "standby":
+        if STANDBY_TAG in have:
+            try:
+                x.cmd(argv, timeout=60)
+            except Exception as e:                   # failed or timed out
+                log("refresh %d: could not remove the %s tag: %s" % (vmid, STANDBY_TAG, e))
+        return
+    if STANDBY_TAG in have:
+        return
+    for attempt in range(1, TAG_TRIES + 1):
+        try:
+            x.cmd(argv, timeout=60)
+            return
+        except Exception as e:                       # failed or timed out
+            if attempt == TAG_TRIES:
+                raise
+            log("refresh %d: tagging failed (try %d of %d), trying again: %s"
+                % (vmid, attempt, TAG_TRIES, e))
+            time.sleep(5)
+
+
 @with_lock
 def v_refresh(cfg, vmid):
     """Rewrite the STOPPED copy of a pair on this node from the latest backup.
@@ -1013,6 +1195,8 @@ def v_refresh(cfg, vmid):
     vmid = parse_vmid(vmid)
     ct, role, base = member(cfg, vmid)
     x = Ctx(cfg, "refresh", ct)
+    if x.live:
+        defer_while_packages_busy("refresh %d" % vmid)
     x.require(container_mode(ct), "CT %d uses a standby container" % base)
     home = pair(cfg, ct)[role][1] if container_mode(ct) else None
     x.require(home == me(), "CT %d belongs on this node (%s)" % (vmid, home))
@@ -1020,9 +1204,17 @@ def v_refresh(cfg, vmid):
     creating = locs == [] and role == "standby"
     x.require(creating or locs == [me()], "CT %d is registered here (or is a new standby)" % vmid)
     if role == "standby" and not creating:
+        # How to recover by hand. A restore that stopped part-way leaves the
+        # config locked (Proxmox refuses pct set and pct destroy until it is
+        # unlocked), and a standby copied from a protected original is protected.
         x.require(STANDBY_TAG in conf_tags(vmid),
                   "CT %d carries the %s tag (it is our standby, not another container)"
-                  % (vmid, STANDBY_TAG))
+                  % (vmid, STANDBY_TAG),
+                  hint="If CT {v} is the standby of CT {b}, check it. If it is locked (a restore "
+                       "stopped part-way), run pct unlock {v} first. Then either tag it (pct set "
+                       "{v} --tags {t}) or remove it (pct set {v} --protection 0, then pct "
+                       "destroy {v}). The next sync refreshes or re-creates it".format(
+                           v=vmid, b=base, t=shlex.quote(";".join(wanted_tags(cfg, ct, role)))))
     if not creating and locs == [me()]:
         x.require(ct_status_local(vmid) == "stopped", "CT %d is stopped" % vmid)
     x.require(role_active(base) != role, "the OTHER copy is the active one, so this copy "
@@ -1038,10 +1230,59 @@ def v_refresh(cfg, vmid):
         x.require(after <= limit, "thin pool would be %.1f%% used (limit %s%%)" % (after, limit))
         if x.live:
             run(["zstd", "-q", "-t", arc], timeout=3600)
+    opts = restore_options()
+    tags = wanted_tags(cfg, ct, role) if container_mode(ct) else []
     argv = ["pct", "restore", str(vmid), arc, "--storage", cl(cfg, "storage", "local-lvm")]
+    # onboot 0 too, for the same reason as the tags below: the backup brings the
+    # original's onboot: 1, and a separate pct set afterwards can fail.
+    onboot_in_restore = "onboot" in opts
+    if onboot_in_restore:
+        argv += ["--onboot", "0"]
+    # The tags go into the restore itself, so they are in the same config write
+    # that finishes it: nothing that fails after the restore (like a pct set
+    # while Proxmox's packages are half upgraded) can leave the standby without
+    # its tag, which would make every later refresh refuse to touch it.
+    in_restore = "tags" in opts and bool(tags)
+    if in_restore:
+        argv += ["--tags", ";".join(tags)]
     lifted = False
     if not creating:
         argv += ["--force", "1"]
+        # Proxmox VE 9.3 gives every guest a uid and refuses to restore a backup
+        # over a container with a different uid ("backup belongs to another
+        # guest"), even with --force. The two copies of a pair always differ: the
+        # standby was made from the original's backup but could not take its uid,
+        # which the original still has. So every refresh, of the standby and of
+        # the original during failback, trips that check. The option is safe
+        # here: it lifts only that identity check, and only on a copy the guards
+        # above already cleared for overwriting (our tagged, stopped standby, or
+        # the stopped original while it is being failed back to; never the
+        # active copy). Proxmox then keeps the overwritten copy's own uid, so
+        # each copy keeps its identity. Versions before 9.3 have neither the
+        # check nor the option, so it is passed only when this pct lists it.
+        if "allow-identity-mismatch" in opts:
+            # For a pair, Proxmox's check is upside down (a right refresh is
+            # always a mismatch), so the option turns it off. This puts the
+            # check the right way round: the backup must be of the OTHER copy,
+            # the one whose data this copy takes. A misfiled or old archive (a
+            # backup of this copy itself, or of another guest) is refused
+            # before anything changes. If either uid can't be read (a backup
+            # from before 9.3 has none), the refresh goes on as before, since
+            # refusing then would bring back the outage this option fixes.
+            other = "original" if role == "standby" else "standby"
+            ovmid, onode = pair(cfg, ct)[other]
+            buid, ouid = archive_uid(arc), conf_uid(ovmid, onode)
+            if buid and ouid:
+                x.require(buid == ouid,
+                          "the backup is of the other copy, CT %d (backup uid %s, CT %d uid %s)"
+                          % (ovmid, buid, ovmid, ouid),
+                          hint="The archive %s holds another guest's backup, or an old one "
+                               "of this copy. The next backup of CT %d replaces it"
+                               % (arc, ovmid))
+            else:
+                log("refresh %d: %s uid unknown, backup origin not checked" % (
+                    vmid, "the backup's" if not buid else "CT %d's" % ovmid))
+            argv += ["--allow-identity-mismatch", "1"]
         # Proxmox's "protection" flag blocks overwriting. It is lifted only on
         # a copy this tool owns: a standby that carries our tag, or the
         # original while it is being failed back to (the only time it is
@@ -1060,12 +1301,9 @@ def v_refresh(cfg, vmid):
             run(["pct", "set", str(vmid), "--protection", "1"], check=False, timeout=60)
             log("refresh %d failed; protection restored" % vmid)
         raise
-    x.cmd(["pct", "set", str(vmid), "--onboot", "0"], timeout=60)
-    if role == "standby":
-        tags = conf_tags(vmid) if x.live else []
-        if STANDBY_TAG not in tags:
-            tags.append(STANDBY_TAG)
-        x.cmd(["pct", "set", str(vmid), "--tags", ";".join(tags)], timeout=60)
+    if not onboot_in_restore or (x.live and conf_onboot(vmid)):
+        x.cmd(["pct", "set", str(vmid), "--onboot", "0"], timeout=60)
+    settle_tags(x, vmid, role, tags, in_restore)
     if x.live:
         with open(refreshed_path(vmid), "w") as f:
             json.dump({"vmid": vmid, "archive_created": m["created"], "at": now()}, f)
@@ -1384,6 +1622,10 @@ def main(argv):
         result = fn(cfg, *args)
         print(json.dumps({"ok": True, "result": result}))
         return 0
+    except Deferred as e:                        # not a failure: the next pass retries
+        log("DEFERRED %s: %s" % (" ".join(words), e))
+        print(json.dumps({"ok": False, "deferred": True, "error": str(e)}))
+        return 4
     except Refused as e:
         log("REFUSED %s: %s" % (" ".join(words), e))
         print(json.dumps({"ok": False, "refused": True, "error": str(e)}))

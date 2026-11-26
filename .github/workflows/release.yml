@@ -1,38 +1,63 @@
 name: Release
 
-# Runs in the PUBLIC repository when a version tag arrives (or by hand for a
-# tag): builds the download files (tarball, get.sh, SHA256SUMS) and the
-# GitHub release.
+# Runs in the PUBLIC repository only. It makes the GitHub release for a vX.Y.Z tag: on the
+# tag push, on a branch push whose commit carries such a tag (the tag push alone doesn't
+# always start a run), or by hand for an existing tag. A release that already exists is
+# left exactly as it is, so files attached to it by hand are never replaced.
+#
+# Its settings are in .github/release-public.conf, which the release build writes into the
+# public copy from the private settings. The development repository has no such file, so
+# there, and in any copy that isn't the configured public repository, this does nothing.
+#
+# The release: the notes are that version's CHANGELOG.md section (plus RELEASE_NOTES_FOOTER);
+# the files are <repo>-X.Y.Z.tar.gz (RELEASE_TARBALL=1), each RELEASE_ASSET, and SHA256SUMS
+# over them. RELEASE_TEST_COMMAND runs first, and every VERSION_FILE must hold X.Y.Z.
 on:
   push:
-    branches: [main]
-    tags: ["v*.*.*"]
+    tags: ["v*"]
+    branches: ["**"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build the release for, e.g. v1.0.1"
+        description: "Existing tag to make the release for, e.g. v1.2.0"
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   which:
-    # A push to main releases only when that commit carries a vX.Y.Z tag (cut-release pushes
-    # the commit and its tag together, and the tag push alone doesn't always start a run).
-    if: github.repository == 'rob-paprocki/pve-watchdog'
+    # Never in a development repository: they are all named <name>-private.
+    if: ${{ !endsWith(github.repository, '-private') }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 5
     outputs:
       tag: ${{ steps.find.outputs.tag }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - id: find
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
+          IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
+          set -euo pipefail
+          conf=.github/release-public.conf
+          echo "tag=" >> "$GITHUB_OUTPUT"
+          if [ ! -f "$conf" ]; then
+            echo "No $conf: this isn't a published copy, so it makes no releases."; exit 0
+          fi
+          want=$(python3 -I scripts/release/release_conf.py --conf "$conf" get PUBLIC_REPO)
+          if [ -z "$want" ] || [ "$GITHUB_REPOSITORY" != "$want" ]; then
+            echo "This is $GITHUB_REPOSITORY, not the configured public repository; no release."; exit 0
+          fi
+          if [ "$(python3 -I scripts/release/release_conf.py --conf "$conf" get RELEASE_REQUIRE_PUBLIC)" = 1 ] \
+              && [ "$IS_PRIVATE" != false ]; then
+            echo "::error::This repository is private, so it makes no releases."; exit 1
+          fi
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
             tag="$INPUT_TAG"
           elif [ "$GITHUB_REF_TYPE" = tag ]; then
@@ -42,7 +67,8 @@ jobs:
                     --jq ".[] | select(.commit.sha == \"$GITHUB_SHA\") | .name" \
                   | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
           fi
-          [ -n "$tag" ] || echo "No version tag on $GITHUB_SHA; nothing to release."
+          [ -n "$tag" ] || { echo "No version tag on $GITHUB_SHA; nothing to release."; exit 0; }
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tags must look like v1.2.3"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   release:
@@ -50,36 +76,51 @@ jobs:
     if: needs.which.outputs.tag != ''
     concurrency: release-${{ needs.which.outputs.tag }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write     # to create the release and upload its files; nothing else
     env:
       TAG: ${{ needs.which.outputs.tag }}
     steps:
-      - name: Tag must be exactly vX.Y.Z
-        run: |
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag name"; exit 1; }
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: refs/tags/${{ env.TAG }}
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - name: Tests
-        run: PYTHONPATH=controller python3 -m unittest discover -s tests
-      - name: Build download files
-        run: |
-          VERSION="${TAG#v}"
-          git archive --format=tar.gz --prefix="pve-watchdog-$VERSION/" \
-              -o "pve-watchdog-$VERSION.tar.gz" "$TAG"
-          mkdir dist && mv "pve-watchdog-$VERSION.tar.gz" dist/
-          sed "s/@VERSION@/$VERSION/" get.sh > dist/get.sh
-          (cd dist && sha256sum "pve-watchdog-$VERSION.tar.gz" get.sh > SHA256SUMS && cat SHA256SUMS)
-          python3 scripts/release/changelog.py notes "$VERSION" > notes.md
-          printf '\n---\nInstall on each Proxmox node, as root:\n\n```bash\nbash -c "$(curl -fsSL https://github.com/%s/releases/download/%s/get.sh)"\n```\n' \
-              "$GITHUB_REPOSITORY" "$TAG" >> notes.md
-      - name: Create GitHub release (skip if it already exists)
+          ref: refs/tags/${{ needs.which.outputs.tag }}
+          persist-credentials: false
+      - name: Stop if the release exists
+        id: exists
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG already exists; nothing to do"; exit 0
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists; nothing to do (its files are left as they are)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
-          gh release create "$TAG" dist/* --title "pve-watchdog ${TAG#v}" --notes-file notes.md --verify-tag
+      - name: Version files match the tag
+        if: steps.exists.outputs.skip != 'true'
+        run: python3 -I scripts/release/changelog.py verify-version "${TAG#v}" --conf .github/release-public.conf
+      - name: Release tests (RELEASE_TEST_COMMAND)
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -n "$cmd" ] || continue
+            echo "::group::$cmd"
+            TAG="$TAG" bash -euo pipefail -c "$cmd"
+            echo "::endgroup::"
+          done < <(python3 -I scripts/release/release_conf.py --conf .github/release-public.conf get RELEASE_TEST_COMMAND)
+      - name: Build the release files and notes
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          python3 -I scripts/release/release_assets.py "$TAG" dist notes.md
+      - name: Create the release
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title=$(python3 -I scripts/release/release_conf.py --conf .github/release-public.conf get NAME)
+          shopt -s nullglob
+          files=(dist/*)
+          gh release create "$TAG" "${files[@]}" -R "$GITHUB_REPOSITORY" --title "$title ${TAG#v}" \
+              --notes-file notes.md --verify-tag

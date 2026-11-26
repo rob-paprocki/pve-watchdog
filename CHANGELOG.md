@@ -7,6 +7,38 @@ to do anything when upgrading.
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-11-26
+**Upgrading:** re-run `get.sh` on each node. If a standby has already lost its
+`pve-watchdog-standby` tag (the watchdog refuses to refresh it), check it by hand. If
+a restore stopped part-way, the standby is also locked, so run `pct unlock <id>`
+first. Then either add the tag back with `pct set <id> --tags`, or remove the
+standby with `pct set <id> --protection 0` and `pct destroy <id>`; the next sync
+makes a new one.
+
+### Fixed
+- Refresh and failback work again on Proxmox VE 9.3. Every standby refresh there
+  failed with "backup belongs to another guest": 9.3 gives each container a unique
+  ID (uid), won't restore a backup over a container with a different one, and an
+  original and its standby never share a uid. A failback would have failed the same
+  way. The watchdog now passes `--allow-identity-mismatch` when it overwrites its
+  own stopped copy (only on Proxmox versions that have the option), and each copy
+  keeps its uid. That option turns Proxmox's own check off, so the watchdog first
+  compares uids itself: the backup must come from the other copy of the pair. A
+  backup from before 9.3 has no uid and isn't checked.
+- A step that fails after the restore, like a `pct set` while packages are half
+  upgraded, can no longer leave a standby without its `pve-watchdog-standby` tag,
+  because the restore itself now sets the tag and `onboot: 0`. Before, a failure there
+  left the standby untagged and every later refresh refused to touch it. The refusal
+  now says how to fix that.
+- Refreshes wait while packages are being upgraded. While apt or dpkg runs on a node,
+  no backup, refresh or failback involving that node starts, and the next pass tries
+  again. If dpkg starts while a failback is already under way, the container comes
+  back up where it was, with a notice instead of a failure alert. If the wait lasts
+  until a copy is older than `stale_factor` times its interval, the usual stale-copy
+  alert still comes, and says what it's waiting for. Failover doesn't wait.
+- After a failback, the original no longer carries the `pve-watchdog-standby` tag it
+  picked up from the standby's backup.
+
 ## [1.1.3] - 2026-11-15
 **Upgrading:** nothing to do.
 

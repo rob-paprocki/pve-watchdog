@@ -38,6 +38,17 @@ from .hostlink import HostError
 log = logging.getLogger("pve-watchdog.engine")
 
 
+def _put_off(vmid, err, here):
+    """The notice for a failback that a node's dpkg/apt stopped part-way.
+
+    failback() holds a failback while either node reports packages busy, but
+    dpkg can start after that check (during the stop-mode backup, say). That is
+    not a failure, so no alert; the rollback is the same as for one. The one-hour
+    back-off stays: a node's report of its packages lags by up to a tick, and
+    trying again at once could stop CT `here` a second time for nothing."""
+    return "failback of CT %d put off: %s. CT %d starts here again." % (vmid, err, here)
+
+
 def _dry(*results):
     return any(isinstance(r, dict) and r.get("dry_run") for r in results)
 
@@ -93,6 +104,18 @@ class Engine:
         except HostError as e:
             log.warning("liveness probe of %s failed to run (%s); treating as ALIVE", ip, e)
             return True        # unsure -> be safe -> do not start a second copy
+
+    def _packages_busy(self, nodes):
+        """Why not now, if dpkg/apt is upgrading packages on my host or on one of
+        `nodes` (as their hosts last reported); otherwise None."""
+        why = (self.local or {}).get("packages_busy")
+        if why:
+            return "%s on %s" % (why, self.cfg.me)
+        for n in nodes:
+            why = (((self.peer_status.get(n) or {}).get("host")) or {}).get("packages_busy")
+            if why:
+                return "%s on %s" % (why, n)
+        return None
 
     def _peer_reachable_now(self, p):
         t = self.cfg.probe("timeout")
@@ -320,7 +343,12 @@ class Engine:
     def failback(self, c):
         """Move CT c from this node back to its preferred node (planned, ~minutes).
 
-        Only one failback at a time per controller (watcher or CLI)."""
+        Only one failback at a time per controller (watcher or CLI). None starts
+        while dpkg/apt runs on either node: its backup and restore steps would
+        fail (and be rolled back) while Proxmox's packages are half upgraded."""
+        busy = self._packages_busy([c["preferred_node"]])
+        if busy:
+            raise HostError("failback of CT %d waits: %s" % (c["id"], busy), deferred=True)
         run = self._pair_failback if self.cfg.container_mode(c) else self._failback
         if not self.failback_lock:
             return run(c)
@@ -385,8 +413,12 @@ class Engine:
                 raise HostError("peer could not restore/start: %s" % reply.get("error"))
             results.extend((reply.get("result") or {}).values())
         except Exception as err:
-            self.notify.alert("failback-failed-%d" % vmid,
-                              "failback of CT %d failed: %s. Bringing it back up here." % (vmid, err))
+            if getattr(err, "deferred", False):
+                self.notify.info(_put_off(vmid, err, vmid))
+            else:
+                self.notify.alert("failback-failed-%d" % vmid,
+                                  "failback of CT %d failed: %s. Bringing it back up here."
+                                  % (vmid, err))
             try:
                 if released:
                     self.host.restore(vmid)
@@ -658,12 +690,16 @@ class Engine:
                                     "lost (%s)" % (pref, base, self.unclear_wait // 60, lost))
             if not reply.get("ok"):
                 raise HostError("%s could not update/start CT %d: %s"
-                                % (pref, base, reply.get("error")))
+                                % (pref, base, reply.get("error")),
+                                deferred=reply.get("deferred", False))
             results.extend((reply.get("result") or {}).values())
         except Exception as err:
-            self.notify.alert("failback-failed-%d" % base,
-                              "failback of CT %d failed: %s. Starting CT %d here again."
-                              % (base, err, sb))
+            if getattr(err, "deferred", False):
+                self.notify.info(_put_off(base, err, sb))
+            else:
+                self.notify.alert("failback-failed-%d" % base,
+                                  "failback of CT %d failed: %s. Starting CT %d here again."
+                                  % (base, err, sb))
             if stopped:
                 try:
                     self.host.activate(base, "standby")
@@ -834,12 +870,19 @@ def _pair_sync(cfg, host, peers, notify, state, c, e, force, t):
     refreshed = state.ct(base).setdefault("refreshed_on", {})
     missed = bool(arc) and refreshed.get(home) != arc["created"]
     if need_backup or missed:
+        ps = None
         try:
             r = host.backup(me_["id"], "snapshot") if need_backup else {}
             cur = r.get("archive") or arc
             ps = peers.status(node)
             if ps is None:
                 log.info("sync CT %d: %s controller unreachable; will retry", base, home)
+                return
+            busy = (ps.get("host") or {}).get("packages_busy")
+            if busy:            # its refresh would wait anyway: don't send the copy for nothing
+                log.info("sync CT %d: not sending the copy yet, %s on %s", base, busy, home)
+                _pair_stale_check(cfg, peers, notify, c, other, home, t, ps,
+                                  waiting="%s on %s" % (busy, home))
                 return
             pool = (ps.get("host") or {}).get("pool") or {}
             need = (cur or {}).get("used_bytes") or 0
@@ -853,25 +896,44 @@ def _pair_sync(cfg, host, peers, notify, state, c, e, force, t):
             pr = host.push(base, home)
             reply = peers.action(node, "refresh", base, timeout=6 * 3600)
             if not reply.get("ok"):
-                raise HostError("%s could not refresh its copy: %s" % (home, reply.get("error")))
+                raise HostError("%s could not refresh its copy: %s" % (home, reply.get("error")),
+                                deferred=reply.get("deferred", False))
             if cur and not _dry(r, pr, *((reply.get("result") or {}).values())):
                 refreshed[home] = cur["created"]
             notify.resolve("sync-failed-%d" % base, "replication of CT %d works again" % base)
             log.info("sync CT %d -> %s done%s", base, home, " (dry-run)" if _dry(r, pr) else "")
         except Exception as err:
+            if getattr(err, "deferred", False):     # packages being upgraded: not a failure
+                log.info("sync CT %d deferred: %s", base, err)
+                _pair_stale_check(cfg, peers, notify, c, other, home, t, ps, waiting=str(err))
+                return
             notify.alert("sync-failed-%d" % base, "replication of CT %d failed: %s" % (base, err))
         return
+    _pair_stale_check(cfg, peers, notify, c, other, home, t)
+
+
+def _pair_stale_check(cfg, peers, notify, c, other, home, t, ps=None, waiting=None):
+    """Alert when the `other` copy of pair c, on node `home`, is stale or missing.
+
+    Also called while refreshes wait for dpkg/apt. That wait has no time limit (an
+    apt at a prompt, or a hung unattended-upgrades, can hold the lock for days),
+    so waiting must not hide a copy going stale: the alert then says why.
+    ps: the peer's status if this pass already has it (a deferred refresh changed
+    nothing there, so it is still current)."""
     if cfg.dry_run or c.get("mode") != "live":
         return
-    ps = peers.status(node)
+    base = c["id"]
     if ps is None:
-        return
+        ps = peers.status(cfg.nodes[home])
+        if ps is None:
+            return
     pe = ((ps.get("host") or {}).get("cts") or {}).get(str(base)) or {}
     ref = (((pe.get("members") or {}).get(other) or {}).get("refreshed") or {}).get("archive_created")
     max_age = cfg.policy("stale_factor") * c.get("interval_min", 30) * 60
     key = "stale-%s-%d" % (home, base)
     if not ref or t - ref > max_age:
-        notify.alert(key, "the copy of CT %d on %s is stale or missing" % (base, home))
+        notify.alert(key, "the copy of CT %d on %s is stale or missing%s" % (
+            base, home, ". Its refresh is waiting: %s" % waiting if waiting else ""))
     else:
         notify.resolve(key, "the copy of CT %d on %s is fresh again" % (base, home))
 
@@ -898,6 +960,7 @@ def sync(cfg, host, peers, notify, state, only=None, force=False, clock=time.tim
         delivered = state.ct(vmid).setdefault("delivered", {})
         missed = bool(arc) and any(delivered.get(p["name"]) != arc["created"] for p in cfg.peers())
         due = need_backup or missed
+        waiting = None
         if due:
             try:
                 r = host.backup(vmid, "snapshot") if need_backup else {}
@@ -925,10 +988,19 @@ def sync(cfg, host, peers, notify, state, only=None, force=False, clock=time.tim
                 notify.resolve("sync-failed-%d" % vmid, "replication of CT %d works again" % vmid)
                 log.info("sync CT %d done%s", vmid, " (dry-run)" if _dry(r) else "")
             except HostError as err:
-                notify.alert("sync-failed-%d" % vmid, "replication of CT %d failed: %s" % (vmid, err))
+                if not err.deferred:
+                    notify.alert("sync-failed-%d" % vmid, "replication of CT %d failed: %s"
+                                 % (vmid, err))
+                    continue
+                # Packages being upgraded: not a failure. Only the backup waits, and
+                # before anything was sent, so the peers' status below is current.
+                log.info("sync CT %d deferred: %s", vmid, err)
+                waiting = str(err)
         # Staleness of the copy on each peer (live mode only; dry-run never copies).
-        # Skipped in the pass that just copied: the peer's status may predate it.
-        if due or cfg.dry_run or c.get("mode") != "live":
+        # Skipped in the pass that just copied: the peer's status may predate it. A
+        # pass that only waited for dpkg/apt is checked: that wait has no time limit,
+        # and must not hide a copy going stale.
+        if (due and not waiting) or cfg.dry_run or c.get("mode") != "live":
             continue
         for p in cfg.peers():
             ps = peers.status(p)
@@ -938,7 +1010,9 @@ def sync(cfg, host, peers, notify, state, only=None, force=False, clock=time.tim
             max_age = cfg.policy("stale_factor") * c.get("interval_min", 30) * 60
             if not parc or t - parc["created"] > max_age:
                 notify.alert("stale-%s-%d" % (p["name"], vmid),
-                             "copy of CT %d on %s is stale or missing" % (vmid, p["name"]))
+                             "copy of CT %d on %s is stale or missing%s" % (
+                                 vmid, p["name"], ". Copies are waiting: %s" % waiting
+                                 if waiting else ""))
             else:
                 notify.resolve("stale-%s-%d" % (p["name"], vmid),
                                "copy of CT %d on %s is fresh again" % (vmid, p["name"]))

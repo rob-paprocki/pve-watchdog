@@ -154,6 +154,13 @@ class TakeoverTests(unittest.TestCase):
         ticks(eng, clock, 5)                      # does not repeat in the same episode
         self.assertEqual(host.verbs().count("claim"), 1)
 
+    def test_takeover_does_not_wait_for_packages(self):
+        """Only backups, refreshes and failbacks wait for dpkg/apt; a failover never does."""
+        eng, host, probes, peers, clock = make()
+        host.st["packages_busy"] = "dpkg/apt is installing or upgrading packages (pid 4242)"
+        ticks(eng, clock, 16)
+        self.assertEqual(host.verbs(), ["force_quorum", "claim", "restore", "start"])
+
     def test_no_force_quorum_when_already_quorate(self):
         eng, host, probes, peers, clock = make(me="pve2")
         host.st["quorum"]["quorate"] = True       # e.g. node-a taking over node-b
@@ -319,6 +326,26 @@ class FailbackTests(unittest.TestCase):
                                          ("pve1", "restore_start", 9001)])
         self.assertIn("back on its preferred node", queued(eng))
 
+    def test_failback_waits_while_packages_are_upgraded(self):
+        """No failback starts while dpkg/apt runs on either node; it starts right after,
+        without the one-hour back-off of a failed attempt."""
+        for where in ("pve1", "pve2"):
+            with self.subTest(where):
+                eng, host, probes, peers, clock = make()
+                self._healthy_peer(eng, probes, peers, host)
+                busy = "dpkg/apt is installing or upgrading packages (pid 4242)"
+                if where == "pve2":
+                    host.st["packages_busy"] = busy
+                else:
+                    peers.reachable["pve1"]["host"]["packages_busy"] = busy
+                ticks(eng, clock, 70)
+                self.assertEqual(host.calls, [])
+                self.assertEqual(peers.actions, [])
+                host.st.pop("packages_busy", None)
+                peers.reachable["pve1"]["host"].pop("packages_busy", None)
+                ticks(eng, clock, 1)
+                self.assertEqual(host.verbs(), ["stop", "backup", "push", "release"])
+
     def test_failback_rollback_when_peer_cannot_restore(self):
         eng, host, probes, peers, clock = make()
         self._healthy_peer(eng, probes, peers, host)
@@ -326,6 +353,20 @@ class FailbackTests(unittest.TestCase):
         ticks(eng, clock, 62)
         self.assertEqual(host.verbs(), ["stop", "backup", "push", "release", "restore", "start"])
         self.assertIn("failback of CT 9001 failed", queued(eng))
+
+    def test_dpkg_starting_mid_failback_is_not_a_failure(self):
+        """The stop-mode backup waits (dpkg started after failback() checked): CT 9001
+        starts here again as after a failure, with no alert, and no retry for an hour."""
+        eng, host, probes, peers, clock = make()
+        self._healthy_peer(eng, probes, peers, host)
+        host.fail["backup"] = HostError("backup 9001 waits: dpkg/apt is upgrading packages",
+                                        deferred=True)
+        ticks(eng, clock, 62)
+        self.assertEqual(host.verbs(), ["stop", "backup", "start"])
+        self.assertIn("failback of CT 9001 put off: backup 9001 waits", queued(eng))
+        self.assertNotIn("failback-failed-9001", eng.notify.state.get("alerts", {}))
+        ticks(eng, clock, 30)
+        self.assertEqual(host.verbs().count("stop"), 1)
 
     def test_lost_reply_but_peer_took_it_no_rollback(self):
         eng, host, probes, peers, clock = make()
@@ -435,6 +476,14 @@ class PairTests(unittest.TestCase):
         ticks(eng, clock, 5)
         self.assertEqual(host.verbs().count("activate"), 1)      # once per episode
 
+    def test_takeover_does_not_wait_for_packages(self):
+        """The standby starts even while dpkg/apt runs here. (A dead peer's status is
+        None, so only this node's own report could hold a takeover back.)"""
+        eng, host, probes, peers, clock = make_pair()
+        host.st["packages_busy"] = "dpkg/apt is installing or upgrading packages (pid 4242)"
+        ticks(eng, clock, 16)
+        self.assertEqual(host.calls, [("force_quorum",), ("activate", 9001, "standby")])
+
     def test_takeover_aborted_if_original_ip_answers(self):
         eng, host, probes, peers, clock = make_pair()
         host.alive_ips.add("192.168.100.231")
@@ -489,6 +538,32 @@ class PairTests(unittest.TestCase):
         self.assertEqual(host.calls[-1], ("activate", 9001, "standby"))
         self.assertIn("failback of CT 9001 failed", queued(eng))
 
+    def test_dpkg_starting_mid_failback_is_not_a_failure(self):
+        """dpkg/apt starts after failback() checked: on node-a (its refresh waits) or
+        here (the stop-mode backup waits). Same rollback as a failure, but no alert,
+        and the one-hour back-off still holds the next try."""
+        busy = "dpkg/apt is upgrading packages"
+        ways = {
+            "node-a": lambda host, peers: setattr(peers, "action_reply", {
+                "ok": False, "deferred": True, "error": "refresh 9001 waits: " + busy}),
+            "here": lambda host, peers: host.fail.update(
+                backup=HostError("backup 10001 waits: " + busy, deferred=True)),
+        }
+        for where, wait in ways.items():
+            with self.subTest(where):
+                eng, host, probes, peers, clock = make_pair(active="standby", my_status="running")
+                self._healthy_a(probes, peers, host)
+                wait(host, peers)
+                ticks(eng, clock, 61)
+                self.assertEqual(host.calls[0], ("stop", 10001))
+                self.assertEqual(host.calls[-1], ("activate", 9001, "standby"))
+                out = queued(eng)
+                self.assertIn("failback of CT 9001 put off: ", out)
+                self.assertIn(busy, out)
+                self.assertNotIn("failback-failed-9001", eng.notify.state.get("alerts", {}))
+                ticks(eng, clock, 30)                       # 5 more minutes: no second stop
+                self.assertEqual(host.verbs().count("stop"), 1)
+
     def test_failback_lost_reply_but_original_active_no_rollback(self):
         eng, host, probes, peers, clock = make_pair(active="standby", my_status="running")
         self._healthy_a(probes, peers, host)
@@ -516,6 +591,76 @@ class PairTests(unittest.TestCase):
         sync(eng.cfg, host, peers, eng.notify, eng.state, only=9001, clock=clock)
         self.assertEqual(host.calls, [("backup", 9001, "snapshot"), ("push", 9001, "pve2")])
         self.assertEqual(peers.actions, [("pve2", "refresh", 9001)])
+
+    def test_pair_failback_waits_while_the_original_node_upgrades(self):
+        eng, host, probes, peers, clock = make_pair(active="standby", my_status="running")
+        self._healthy_a(probes, peers, host)
+        peers.reachable["pve1"]["host"]["packages_busy"] = "dpkg/apt is upgrading packages"
+        ticks(eng, clock, 70)
+        self.assertEqual(host.calls, [])                    # the standby keeps running
+        del peers.reachable["pve1"]["host"]["packages_busy"]
+        ticks(eng, clock, 1)
+        self.assertEqual(host.calls[0], ("stop", 10001))
+
+    def _due_pair_sync(self):
+        eng, host, probes, peers, clock = make_pair(me="pve1", my_status="running")
+        host.st["cts"]["9001"]["archive"]["created"] = clock.t - 31 * 60
+        peers.reachable["pve2"] = {"host": {"pool": {"size": 100 * 2**30, "used": 10 * 2**30}}}
+        return eng, host, peers, clock
+
+    def test_sync_deferred_refresh_is_not_a_failure(self):
+        eng, host, peers, clock = self._due_pair_sync()
+        peers.action_reply = {"ok": False, "deferred": True,
+                              "error": "refresh 10001 waits: dpkg/apt is upgrading packages"}
+        sync(eng.cfg, host, peers, eng.notify, eng.state, only=9001, clock=clock)
+        self.assertEqual(peers.actions, [("pve2", "refresh", 9001)])
+        self.assertNotIn("replication of CT 9001 failed", queued(eng))
+        self.assertNotIn("pve2", eng.state.ct(9001).get("refreshed_on", {}))   # still owed
+
+    def test_sync_sends_nothing_to_a_node_that_upgrades(self):
+        """Its refresh would only wait: don't send a multi-GB copy every minute for nothing."""
+        eng, host, peers, clock = self._due_pair_sync()
+        peers.reachable["pve2"]["host"]["packages_busy"] = "dpkg/apt is upgrading packages"
+        sync(eng.cfg, host, peers, eng.notify, eng.state, only=9001, clock=clock)
+        self.assertEqual(host.calls, [("backup", 9001, "snapshot")])
+        self.assertEqual(peers.actions, [])
+        self.assertNotIn("failed", queued(eng))
+
+    def test_sync_deferred_backup_is_not_a_failure(self):
+        eng, host, peers, clock = self._due_pair_sync()
+        host.fail["backup"] = HostError("backup 9001 waits", deferred=True)
+        sync(eng.cfg, host, peers, eng.notify, eng.state, only=9001, clock=clock)
+        self.assertEqual(peers.actions, [])
+        self.assertNotIn("failed", queued(eng))
+
+    def test_a_long_wait_still_alerts_a_stale_standby(self):
+        """A refresh can wait for days (an apt at a prompt). That must not hide the
+        standby going stale: the usual alert comes, and says what it waits for."""
+        busy = "dpkg/apt is upgrading packages"
+        ways = {
+            "node-b upgrades": lambda host, peers: peers.reachable["pve2"]["host"].update(
+                packages_busy=busy),
+            "node-b's refresh waits": lambda host, peers: setattr(peers, "action_reply", {
+                "ok": False, "deferred": True, "error": "refresh 10001 waits: " + busy}),
+            "my backup waits": lambda host, peers: host.fail.update(
+                backup=HostError("backup 9001 waits: " + busy, deferred=True)),
+        }
+        for name, wait in ways.items():
+            for age_min, stale in ((60, False), (91, True), (None, True)):   # limit: 3 x 30 min
+                with self.subTest(name, age_min=age_min):
+                    eng, host, peers, clock = self._due_pair_sync()
+                    if age_min is not None:
+                        peers.reachable["pve2"]["host"]["cts"] = {"9001": {"members": {
+                            "standby": {"refreshed": {"archive_created": clock.t - age_min * 60}}}}}
+                    wait(host, peers)
+                    sync(eng.cfg, host, peers, eng.notify, eng.state, only=9001, clock=clock)
+                    out = queued(eng)
+                    self.assertEqual("stale-pve2-9001" in eng.notify.state.get("alerts", {}), stale)
+                    if stale:
+                        self.assertIn("the copy of CT 9001 on pve2 is stale or missing. Its "
+                                      "refresh is waiting: ", out)
+                        self.assertIn(busy, out)
+                    self.assertNotIn("failed", out)
 
     def test_sync_never_from_the_passive_copy(self):
         eng, host, probes, peers, clock = make_pair(me="pve2", my_status="stopped")
@@ -661,6 +806,58 @@ class SyncTests(unittest.TestCase):
         sync(eng.cfg, host, peers, eng.notify, eng.state, clock=clock)
         self.assertIn("replication of CT 9002 failed", queued(eng))
 
+    def test_deferred_backup_does_not_alert(self):
+        eng, host, probes, peers, clock = make()
+        host.st["cts"]["9002"]["archive"] = None
+        host.fail["backup"] = HostError("backup 9002 waits: dpkg/apt is upgrading packages",
+                                        deferred=True)
+        sync(eng.cfg, host, peers, eng.notify, eng.state, clock=clock)
+        self.assertEqual(host.verbs(), ["backup"])
+        self.assertNotIn("failed", queued(eng))
+
+    def test_a_long_wait_still_alerts_a_stale_copy(self):
+        """A backup can wait for days (an apt at a prompt). That must not hide the copy
+        on the peer going stale: the usual alert comes, and says what it waits for."""
+        for age_min, stale in ((60, False), (91, True), (None, True)):       # limit: 3 x 30 min
+            with self.subTest(age_min=age_min):
+                eng, host, probes, peers, clock = make()
+                host.st["cts"]["9002"]["archive"]["created"] = clock.t - 31 * 60     # due
+                host.fail["backup"] = HostError("backup 9002 waits: dpkg/apt is upgrading "
+                                                "packages", deferred=True)
+                peers.reachable["pve1"] = {"host": {"cts": {} if age_min is None else {
+                    "9002": {"archive": {"created": clock.t - age_min * 60}}}}}
+                sync(eng.cfg, host, peers, eng.notify, eng.state, clock=clock)
+                out = queued(eng)
+                self.assertEqual("stale-pve1-9002" in eng.notify.state.get("alerts", {}), stale)
+                if stale:
+                    self.assertIn("copy of CT 9002 on pve1 is stale or missing. Copies are "
+                                  "waiting: backup 9002 waits: dpkg/apt", out)
+                self.assertNotIn("failed", out)
+
+    def test_a_failure_alerts_once_not_also_stale(self):
+        """Unchanged: a real failure raises sync-failed, and that pass skips the stale check."""
+        eng, host, probes, peers, clock = make()
+        host.st["cts"]["9002"]["archive"]["created"] = clock.t - 31 * 60
+        host.fail["backup"] = HostError("vzdump failed")
+        peers.reachable["pve1"] = {"host": {"cts": {}}}
+        sync(eng.cfg, host, peers, eng.notify, eng.state, clock=clock)
+        self.assertEqual(sorted(eng.notify.state.get("alerts", {})), ["sync-failed-9002"])
+
+
+class HostLinkTests(unittest.TestCase):
+    def test_deferred_reply_becomes_a_deferred_error(self):
+        from unittest import mock
+        from pve_watchdog import hostlink
+
+        class P:
+            returncode, stderr = 4, ""
+            stdout = '{"ok": false, "deferred": true, "error": "refresh 10001 waits"}\n'
+        with mock.patch.object(hostlink.subprocess, "run", lambda *a, **k: P()):
+            with self.assertRaises(HostError) as e:
+                hostlink.Host("192.168.100.250").refresh(10001)
+        self.assertTrue(e.exception.deferred)
+        self.assertFalse(e.exception.refused)
+
 
 class SigningTests(unittest.TestCase):
     """Real round trips between a client and a server on this machine."""
@@ -698,6 +895,20 @@ class SigningTests(unittest.TestCase):
         c = PeerClient(b"k", self.port, "pve2")
         self.assertFalse(c.action(self.node, "rm_rf", 9001)["ok"])
         self.assertEqual(self.actions, [])
+
+    def test_deferral_crosses_to_the_other_node(self):
+        def busy(frm, verb, vmid):
+            raise HostError("refresh 10001 waits: dpkg/apt is upgrading packages", deferred=True)
+        srv = PeerServer("pve1", "127.0.0.1", 0, b"k", lambda: {}, busy)
+        srv.start()
+        try:
+            c = PeerClient(b"k", srv.httpd.server_address[1], "pve2")
+            r = c.action(self.node, "refresh", 9001)
+        finally:
+            srv.httpd.shutdown()
+        self.assertEqual((r["ok"], r["deferred"]), (False, True))
+        self.assertFalse(PeerClient(b"k", self.port, "pve2").action(
+            self.node, "rm_rf", 9001)["deferred"])
 
     def test_replay_and_staleness(self):
         g = ReplayGuard(started=time.time() - 5)

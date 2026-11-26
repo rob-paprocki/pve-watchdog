@@ -141,8 +141,9 @@ class PeerServer:
                     res = server.action_fn(str(req["from"]), req["verb"], int(req["vmid"]))
                     self._reply(sig, {"ok": True, "result": res})
                 except Exception as e:
-                    log.warning("peer action failed: %s", e)
-                    self._reply(sig, {"ok": False, "error": str(e)})
+                    deferred = bool(getattr(e, "deferred", False))   # a HostError: "not now"
+                    (log.info if deferred else log.warning)("peer action failed: %s", e)
+                    self._reply(sig, {"ok": False, "error": str(e), "deferred": deferred})
 
         self.httpd = ThreadingHTTPServer((bind_ip, port), Handler)
 

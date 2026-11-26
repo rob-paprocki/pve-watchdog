@@ -15,9 +15,13 @@ KNOWN_HOSTS = "/etc/pve-watchdog/known_hosts"
 
 
 class HostError(Exception):
-    def __init__(self, msg, refused=False):
+    """refused: a safety rule said no. deferred: not now (packages are being
+    upgraded on the host); nothing was changed and the next pass tries again."""
+
+    def __init__(self, msg, refused=False, deferred=False):
         super().__init__(msg)
         self.refused = refused
+        self.deferred = deferred
 
 
 class Host:
@@ -45,7 +49,8 @@ class Host:
         except (IndexError, ValueError):
             raise HostError("bad reply from host for %r: %s" % (words, (p.stderr or p.stdout)[-300:]))
         if not reply.get("ok"):
-            raise HostError(reply.get("error", "unknown error"), refused=reply.get("refused", False))
+            raise HostError(reply.get("error", "unknown error"), refused=reply.get("refused", False),
+                            deferred=reply.get("deferred", False))
         res = reply["result"]
         if isinstance(res, dict) and res.get("dry_run"):
             for w in res.get("would_run", []):
